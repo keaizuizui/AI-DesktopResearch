@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行时产物
+output/
+cache/
+gptr_service/cache/
+uploads/temp/
+data/
+*.log
+
+# 本地配置与密钥（不提交到开源仓库）
+.env
+!.env.example
+research_config*.json
+!调研工具/research_config.example.json
+
+# 业务数据库与备份文件
+skb.db
+*checkpoint.db
+*.sqlite
+*.sqlite3
+*.bak.*
+
+# 测试产物
+test_report.html
+test_report.json
+test_result.json
+test_engine_report.json
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 本地工具缓存
+.coderef/
+.gitnexus/
+docs/cr*.txt

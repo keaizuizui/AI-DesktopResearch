@@ -1,0 +1,100 @@
+#
+# 小醉桌面研究 — 统一依赖清单（版本锁定版）
+# =========================================
+# 生成时间: 2026-05-28
+# 使用: pip install -r requirements.txt
+#
+# ⚠️ 全部 MIT/BSD/Apache 许可证，无 AGPL/GPL/SSPL 风险
+#
+# Python版本要求: >= 3.10
+# 原因: 第三方库 gpt_researcher 使用 match-case 语法和联合类型注解 (X | Y)
+#
+# 内置Python环境: ../Python3.14/pythoncore-3.14-64/
+# 移出 working 以避免扫描误报。本地测试gui会作为fallback自动检测。
+#
+
+# ─── 桌面 GUI 主题 ───
+sv-ttk>=2.6.1                 # Windows 11 Fluent 风格 ttk 主题（MIT许可证）
+
+# ─── LLM通信 ───
+openai==2.37.0
+requests==2.33.1
+
+# ─── 配置管理 ───
+PyYAML==6.0.3
+python-dotenv>=1.2.0
+cryptography>=46.0.0        # 配置加密（Fernet）
+
+# ─── 文档处理（全部 MIT 许可证） ───
+pdfplumber==0.11.9        # PDF解析（替代PyMuPDF AGPL）
+python-docx==1.2.0        # Word解析
+openpyxl==3.1.5           # Excel导出
+markitdown>=0.1.0         # 多格式文档→Markdown（微软开源，MIT许可证）
+pypandoc>=1.6.3           # pandoc Python封装（可选，提供备用接口）
+# pdf2image==1.17.0       # PDF→图片（需要poppler，可选）
+
+# ─── 数据与计算 ───
+numpy==2.2.6
+pandas==2.3.3
+
+# ─── 异步HTTP ───
+aiohttp>=3.14.0
+httpx==0.28.1
+
+# ─── Web服务（调研工具） ───
+Flask==3.1.3
+werkzeug>=3.1.0
+
+# ─── Web服务（方案工具/管理台） ───
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+streamlit>=1.40.0            # 方案工具管理台
+python-multipart>=0.0.31      # FastAPI文件上传
+python-jose[cryptography]>=3.3.0  # JWT认证
+passlib[bcrypt]>=1.7.4       # 密码哈希
+aiosqlite>=0.20.0             # 异步SQLite
+
+# ─── GPT-Researcher ───
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+colorama==0.4.6
+beautifulsoup4>=4.12.0
+
+# ─── 搜索（可选） ───
+# duckduckgo_search>=6.0.0  # DDG免费搜索（代码已预埋）
+
+# ─── LLM 增强 ───
+instructor>=0.5.0            # LLM结构化输出（Pydantic模型）
+sentry-sdk[fastapi]>=2.0.0   # 错误追踪与告警
+
+# ─── 可观测性（可选） ───
+langfuse>=2.0.0               # LLM调用链追踪（可选）
+
+# ─── PDF增强（可选） ───
+camelot-py[cv]>=0.11.0        # PDF复杂表格提取（需Ghostscript）
+
+# ─── 版面分析与OCR（可选） ───
+# PP-StructureV3 轻量版：版面检测 + OCR（~25MB），CPU可用
+# 安装：pip install paddlepaddle paddleocr
+# 使用：shared/document/ocr/ → OCRProvider.PPSTRUCTURE
+# paddle>=3.0.0                    # 飞桨框架（CPU版，默认）
+# paddleocr>=3.0.0                 # PaddleOCR（含PP-StructureV3）
+
+# ─── 网页提取增强（可选） ───
+# requests 已安装（Jina Reader 只需 requests）
+
+# ─── 本地知识库搜索（可选） ───
+meilisearch>=0.31.0            # Meilisearch本地知识库索引（MIT许可证，docker run -p 7700:7700 getmeili/meilisearch）
+
+# ─── 时间序列预测（可选） ───
+timesfm[torch]>=2.0.0          # Google TimesFM 2.5 时间序列基础模型（Apache 2.0）
+
+# ─── 监控（可选）
+prometheus-client>=0.20.0     # Prometheus 指标采集
+
+# ─── 浏览器自动化（调研工具）
+playwright>=1.60.0            # 动态网页渲染与抓取
+
+# ─── 任务队列（可选，需要 Redis）
+rq>=1.16.0                     # 轻量级任务队列
+redis>=5.0.0                    # Redis 客户端

@@ -1,0 +1,98 @@
+{
+  "version": "1.0.0",
+  "description": "优质数据源列表 — 启动时自动健康检测，死源自动跳过。参考 deep-research sources.json 定制。",
+  "health_check": {
+    "enabled": true,
+    "timeout_seconds": 10,
+    "retry_count": 2,
+    "concurrency": 5
+  },
+  "categories": {
+    "government_official": {
+      "label": "政府与官方数据",
+      "priority": "S",
+      "sources": [
+        {"name": "国家统计局", "url": "https://www.stats.gov.cn", "type": "data"},
+        {"name": "中国人民银行", "url": "https://www.pbc.gov.cn", "type": "data"},
+        {"name": "中国证监会", "url": "https://www.csrc.gov.cn", "type": "data"},
+        {"name": "国家药监局", "url": "https://www.nmpa.gov.cn", "type": "data"},
+        {"name": "世界银行", "url": "https://data.worldbank.org", "type": "data"},
+        {"name": "IMF", "url": "https://www.imf.org", "type": "data"},
+        {"name": "OECD", "url": "https://www.oecd.org", "type": "data"},
+        {"name": "巨潮资讯", "url": "https://www.cninfo.com.cn", "type": "data"},
+        {"name": "上交所", "url": "https://www.sse.com.cn", "type": "data"},
+        {"name": "深交所", "url": "https://www.szse.cn", "type": "data"},
+        {"name": "港交所", "url": "https://www.hkexnews.hk", "type": "data"},
+        {"name": "SEC", "url": "https://www.sec.gov", "type": "data"}
+      ]
+    },
+    "consulting_research": {
+      "label": "咨询与研究机构",
+      "priority": "A",
+      "sources": [
+        {"name": "麦肯锡", "url": "https://www.mckinsey.com", "type": "research"},
+        {"name": "BCG", "url": "https://www.bcg.com", "type": "research"},
+        {"name": "德勤", "url": "https://www.deloitte.com", "type": "research"},
+        {"name": "普华永道", "url": "https://www.pwc.com", "type": "research"},
+        {"name": "Gartner", "url": "https://www.gartner.com", "type": "research"},
+        {"name": "IDC", "url": "https://www.idc.com", "type": "research"},
+        {"name": "CB Insights", "url": "https://www.cbinsights.com", "type": "research"},
+        {"name": "艾瑞咨询", "url": "https://www.iresearch.cn", "type": "research"},
+        {"name": "易观分析", "url": "https://www.analysys.cn", "type": "research"},
+        {"name": "199IT", "url": "https://www.199it.com", "type": "research"},
+        {"name": "QuestMobile", "url": "https://www.questmobile.com.cn", "type": "research"},
+        {"name": "TalkingData", "url": "https://www.talkingdata.com", "type": "research"}
+      ]
+    },
+    "financial_media": {
+      "label": "财经与商业媒体",
+      "priority": "A",
+      "sources": [
+        {"name": "财新网", "url": "https://www.caixin.com", "type": "news"},
+        {"name": "第一财经", "url": "https://www.yicai.com", "type": "news"},
+        {"name": "21世纪经济报道", "url": "https://www.21jingji.com", "type": "news"},
+        {"name": "界面新闻", "url": "https://www.jiemian.com", "type": "news"},
+        {"name": "36氪", "url": "https://36kr.com", "type": "news"},
+        {"name": "虎嗅", "url": "https://www.huxiu.com", "type": "news"},
+        {"name": "创业邦", "url": "https://www.cyzone.cn", "type": "news"},
+        {"name": "投资界", "url": "https://www.pedaily.cn", "type": "news"},
+        {"name": "Reuters", "url": "https://www.reuters.com", "type": "news"},
+        {"name": "Bloomberg", "url": "https://www.bloomberg.com", "type": "news"},
+        {"name": "Financial Times", "url": "https://www.ft.com", "type": "news"}
+      ]
+    },
+    "china_platforms": {
+      "label": "中文内容平台",
+      "priority": "B",
+      "sources": [
+        {"name": "知乎", "url": "https://www.zhihu.com", "type": "community"},
+        {"name": "百度百科", "url": "https://baike.baidu.com", "type": "reference"},
+        {"name": "CSDN", "url": "https://www.csdn.net", "type": "tech"},
+        {"name": "澎湃新闻", "url": "https://www.thepaper.cn", "type": "news"},
+        {"name": "东方财富", "url": "https://www.eastmoney.com", "type": "data"},
+        {"name": "人民网", "url": "https://www.people.com.cn", "type": "news"},
+        {"name": "新华网", "url": "https://www.xinhuanet.com", "type": "news"},
+        {"name": "豆瓣", "url": "https://www.douban.com", "type": "community"},
+        {"name": "微博", "url": "https://www.weibo.com", "type": "social"},
+        {"name": "IT桔子", "url": "https://www.itjuzi.com", "type": "data"},
+        {"name": "企查查", "url": "https://www.qcc.com", "type": "data"},
+        {"name": "天眼查", "url": "https://www.tianyancha.com", "type": "data"}
+      ]
+    },
+    "specialized": {
+      "label": "行业垂直",
+      "priority": "A",
+      "sources": [
+        {"name": "动脉网", "url": "https://www.vbdata.cn", "type": "healthcare"},
+        {"name": "亿欧", "url": "https://www.iyiou.com", "type": "research"},
+        {"name": "站长之家", "url": "https://www.chinaz.com", "type": "tech"},
+        {"name": "开源中国", "url": "https://www.oschina.net", "type": "tech"},
+        {"name": "InfoQ中国", "url": "https://www.infoq.cn", "type": "tech"},
+        {"name": "掘金", "url": "https://juejin.cn", "type": "tech"},
+        {"name": "雪球", "url": "https://xueqiu.com", "type": "finance"},
+        {"name": "集微网", "url": "https://www.jiweinet.com", "type": "semiconductor"},
+        {"name": "中国连锁经营协会", "url": "https://www.ccfa.org.cn", "type": "retail"}
+      ]
+    }
+  }
+}
