@@ -3636,11 +3636,15 @@ class FusionResearchBot:
             ref_limit = int(self.cfg.get("reference_list_limit", 50) or 0)
         except (TypeError, ValueError):
             ref_limit = 50
+        cited_max = max((int(x.strip("[]")) for x in citations), default=0)
+        # 参考文献上限至少覆盖正文实际引用到的最大编号，避免与写作编号打架
+        if ref_limit > 0:
+            ref_limit = max(ref_limit, cited_max)
         max_ref = (len(self.all_materials) if ref_limit <= 0
                    else min(len(self.all_materials), ref_limit))
         if self.all_materials and citations:
             for n_str in set(citations):
-                n = int(n_str)
+                n = int(n_str.strip("[]"))
                 if n < 1 or n > max_ref:
                     invalid_citations.append(n)
         result["citation_count"] = len(citations)
@@ -4343,6 +4347,13 @@ class FusionResearchBot:
             limit = int(self.cfg.get("reference_list_limit", 50) or 0)
         except (TypeError, ValueError):
             limit = 50
+        # 正文已引用的最大编号必须出现在参考文献里
+        cited_max = 0
+        for ch in self.chapters_md:
+            for x in re.findall(r'\[(\d+)\]', ch):
+                cited_max = max(cited_max, int(x))
+        if limit > 0:
+            limit = max(limit, cited_max)
         mats = self.all_materials[:limit] if limit > 0 else self.all_materials
         seen = {}
         refs = []
