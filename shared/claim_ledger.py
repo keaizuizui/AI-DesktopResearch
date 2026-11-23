@@ -102,6 +102,7 @@ class GateResult:
     """门控检查结果"""
     passed: bool
     unsupported_claims: List[Claim] = field(default_factory=list)
+    number_miss_claims: List[Claim] = field(default_factory=list)
     stale_claims: List[Claim] = field(default_factory=list)
     disputed_claims: List[Claim] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -299,25 +300,44 @@ class QualityGate:
                 if c.status == ClaimStatus.DISPUTED]
 
     def run_gate(self, max_age_days: int = 365) -> GateResult:
-        """运行完整门控检查"""
-        unsupported = self.find_unsupported()
+        """运行完整门控检查
+
+        声明分三档：
+        - 无来源（UNSUPPORTED）：没有 [n] 或编号越界
+        - 数值未命中（INFERRED + number_miss）：有 [n]，但声明里的数值没在素材原文找到
+        - 被质疑（DISPUTED）
+        """
+        all_claims = self.ledger.get_all_claims()
+        no_source = [c for c in all_claims if c.status == ClaimStatus.UNSUPPORTED]
+        number_miss = [c for c in all_claims
+                       if c.status == ClaimStatus.INFERRED and c.meta.get("number_miss")]
+        other_inferred = [c for c in all_claims
+                          if c.status == ClaimStatus.INFERRED and not c.meta.get("number_miss")]
         stale = self.find_stale(max_age_days)
         disputed = self.find_disputed()
 
         warnings = []
-        if unsupported:
-            warnings.append(f"有 {len(unsupported)} 个声明无直接来源（含推断）")
+        if no_source:
+            warnings.append(f"有 {len(no_source)} 个声明无来源")
+        if number_miss:
+            warnings.append(f"有 {len(number_miss)} 个声明的数值未在素材原文命中")
+        if other_inferred:
+            warnings.append(f"有 {len(other_inferred)} 个声明为推断")
         if stale:
             warnings.append(f"有 {len(stale)} 个声明来源可能过时")
         if disputed:
             warnings.append(f"有 {len(disputed)} 个声明被后续校验质疑")
 
-        passed = len(unsupported) == 0 and len(disputed) == 0
-        summary = "通过" if passed else f"不通过（{len(unsupported)} 无直接来源, {len(disputed)} 被质疑）"
+        passed = not no_source and not number_miss and not disputed
+        summary = "通过" if passed else (
+            f"不通过（{len(no_source)} 无来源, "
+            f"{len(number_miss)} 数值未命中, {len(disputed)} 被质疑）"
+        )
 
         return GateResult(
             passed=passed,
-            unsupported_claims=unsupported,
+            unsupported_claims=no_source + other_inferred,
+            number_miss_claims=number_miss,
             stale_claims=stale,
             disputed_claims=disputed,
             warnings=warnings,
@@ -405,9 +425,74 @@ class EventLog:
 # 便捷函数：LLM 声明提取
 # ============================================================
 
+_NUM_TOKEN_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(亿|万|千)?\s*(%|％|元|美元|人民币|港元)?')
+_UNIT_SCALE = {"千": 1e3, "万": 1e4, "亿": 1e8}
+
+
+def _normalize_numeric_text(text: str) -> str:
+    """全角转半角、去千分位逗号，减少格式差异导致的误判。"""
+    trans = str.maketrans("０１２３４５６７８９％．，", "0123456789%.,")
+    return (text or "").translate(trans).replace(",", "").replace("，", "")
+
+
+def _extract_number_tokens(text: str) -> List[tuple]:
+    """提取 (数值, 量级单位) 列表；百分比单位统一记为 %。"""
+    tokens = []
+    for m in _NUM_TOKEN_RE.finditer(_normalize_numeric_text(text)):
+        try:
+            value = float(m.group(1))
+        except ValueError:
+            continue
+        mag = m.group(2) or ""
+        if (m.group(3) or "").replace("％", "%") == "%":
+            mag = "%"
+        tokens.append((value, mag))
+    return tokens
+
+
+def _numbers_match(claim_value: str, material_text: str) -> bool:
+    """声明里的数值是否能在素材原文中找到（2% 相对误差）。
+
+    返回 True 的情况：
+    - 声明不含数值（无法机械化比对，不误杀定性结论）
+    - 素材正文为空（无法比对）
+    - 所有数值都能在素材中找到同量级、误差内的对应值
+    """
+    claim_tokens = _extract_number_tokens(claim_value)
+    if not claim_tokens:
+        return True
+    if not (material_text or "").strip():
+        return True
+    mat_tokens = _extract_number_tokens(material_text)
+    if not mat_tokens:
+        return False
+
+    for cv, cu in claim_tokens:
+        hit = False
+        for mv, mu in mat_tokens:
+            # 声明写了百分比，素材也必须是百分比，避免 5% 命中 5元
+            if cu == "%" and mu != "%":
+                continue
+            c_abs = cv * _UNIT_SCALE.get(cu, 1.0)
+            m_abs = mv * _UNIT_SCALE.get(mu, 1.0)
+            # 百分比常被四舍五入到整数，放宽到 5% 或 0.5 个百分点
+            if cu == "%" or mu == "%":
+                tolerance = max(abs(m_abs) * 0.05, 0.5)
+            else:
+                tolerance = max(abs(m_abs) * 0.02, 0.05)
+            if abs(c_abs - m_abs) <= tolerance:
+                hit = True
+                break
+        if not hit:
+            return False
+    return True
+
+
 _GENERIC_METRIC_PATTERNS = [
     # 金额（含亿/万/千与常见货币）
     r'(?:约|近|超过|不足|超|突破|达到)?\s*\d+(?:\.\d+)?\s*(?:亿|万|千)?\s*(?:元|美元|人民币|港元)',
+    # 省略“元”的量级金额：9999亿 / 50万（排除年份和其他已被覆盖的单位）
+    r'\d+(?:\.\d+)?\s*(?:亿|万|千)(?!\s*(?:年|元|美元|人民币|港元|家|人|个|台|店|门店|所|例|项|倍|小时|天|个月|岁))',
     # 百分比与百分比区间
     r'\d+(?:\.\d+)?\s*%\s*(?:[-~～至—–]\s*\d+(?:\.\d+)?\s*%)?',
     # 数量、门店、人群、时长（不含“年”，避免把年份当声明）
@@ -418,28 +503,30 @@ _GENERIC_METRIC_PATTERNS = [
 
 
 def _claim_source_from_citation(sentence: str, materials: List[Any]):
-    """从句子里的 [n] 解析素材来源，返回 (编号, URL, 等级, 声明性质, 标题)。"""
+    """从句子里的 [n] 解析素材来源，返回 (编号, URL, 等级, 声明性质, 标题, 正文)。"""
     m = re.search(r'\[(\d+)\]', sentence or "")
     if not m:
-        return 0, "", "", "", ""
+        return 0, "", "", "", "", ""
     idx = int(m.group(1))
     if not materials:
-        return idx, f"引用编号[{idx}]（素材表未加载）", "", "", ""
+        return idx, f"引用编号[{idx}]（素材表未加载）", "", "", "", ""
     if idx < 1 or idx > len(materials):
-        return idx, f"引用编号[{idx}]越界", "", "", ""
+        return idx, f"引用编号[{idx}]越界", "", "", "", ""
     mat = materials[idx - 1]
     if isinstance(mat, dict):
         url = mat.get("url", "") or mat.get("title", "")
         tier = mat.get("tier", "") or mat.get("grade", "")
         nature = mat.get("claim_nature", "")
         title = mat.get("title", "")
+        content = mat.get("content", "") or ""
     else:
         url = getattr(mat, "url", "") or getattr(mat, "title", "")
         tier = getattr(mat, "tier", "") or getattr(mat, "grade", "")
         nature = getattr(mat, "claim_nature", "")
         title = getattr(mat, "title", "")
+        content = getattr(mat, "content", "") or ""
     return (idx, str(url or ""), str(getattr(tier, "value", tier) or ""),
-            str(nature or ""), str(title or ""))
+            str(nature or ""), str(title or ""), str(content or ""))
 
 
 def extract_claims_from_llm(
@@ -464,9 +551,16 @@ def extract_claims_from_llm(
     seen = set()
 
     def _register(field: str, value: str, claim_type: ClaimType, sentence: str, origin: str):
-        idx, source, tier, nature, title = _claim_source_from_citation(sentence, materials or [])
+        idx, source, tier, nature, title, content = _claim_source_from_citation(
+            sentence, materials or [])
+        number_miss = False
         if idx and source and "越界" not in source and "未加载" not in source:
-            status = ClaimStatus.SUPPORTED
+            # 编号有效只是第一步：数值还必须能在素材原文里找到
+            if _numbers_match(value, content):
+                status = ClaimStatus.SUPPORTED
+            else:
+                status = ClaimStatus.INFERRED
+                number_miss = True
             source_id = f"material:{idx}"
         else:
             status = ClaimStatus.UNSUPPORTED
@@ -485,6 +579,7 @@ def extract_claims_from_llm(
                 "source_grade": tier,
                 "claim_nature": nature,
                 "source_title": title,
+                "number_miss": number_miss,
                 "extracted_from": origin,
             },
         ))

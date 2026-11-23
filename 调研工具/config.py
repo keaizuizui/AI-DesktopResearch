@@ -526,6 +526,7 @@ DEFAULT_CONFIG = {
     "quality_dimensions": "basic",             # basic(纯统计:数据密度/来源覆盖/引用完整性) / full(+LLM逻辑一致性)
     "quality_min_data_density": 3.0,           # 数据密度最低标准：每千字至少N个数字
     "quality_min_source_coverage": 3,          # 来源覆盖度最低标准：至少N个不同引用源
+    "quality_min_support_ratio": 0.6,          # 引用支持率最低标准：有来源且数值可核验的声明占比
 }
 
 CONFIG_FILENAME = "research_config.json"

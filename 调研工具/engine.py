@@ -248,6 +248,7 @@ class FusionResearchBot:
         self.zero_draft_issues: List[Dict] = []
         self.chapter_materials: Dict[int, List[int]] = {}
         self._supplement_triggered: bool = False
+        self._batch_budget_skipped: bool = False  # 批次搜索因预算不足被跳过
         self.global_context = GlobalContext()  # 
 
         # 素材分层注入 — 聚类器 + 综合器
@@ -1093,6 +1094,7 @@ class FusionResearchBot:
             batch_count = len(self.search_batches)
             batch_results = []
             if not self.state.consume_budget(batch_count):
+                self._batch_budget_skipped = True
                 logger.warning(f"[批次搜索] 预算不足(需{batch_count}，剩{self.state.search_budget})，跳过批次搜索")
             else:
                 logger.info(f"[批次搜索] 执行{batch_count}个搜索批次，消耗{batch_count}预算(剩{self.state.search_budget})...")
@@ -3913,26 +3915,26 @@ class FusionResearchBot:
 
         return result
 
-    def _insert_data_limited_notice(self):
-        """在报告中插入数据受限声明。
-
-        当 _check_source_diversity 判定 data_limited=True 时，
-        在报告开头插入醒目的数据说明。
-        """
-        notice = (
-            "\n\n> ⚠️ **数据说明**：本报告基于有限的互联网公开信息生成。"
-            "部分数据来源不够充分，结论仅供参考，"
-            "建议结合一手数据或多源交叉验证后使用。\n"
-        )
-        if self.chapters_md:
-            self.chapters_md[0] = notice + self.chapters_md[0]
-            logger.info("[数据受限声明] 已插入报告开头")
+    def _insert_coverage_notice(self, notes: List[str]):
+        """把素材覆盖不足的多条信号合并成报告开头的一段说明。"""
+        if not self.chapters_md or not notes:
+            return
+        lines = ["\n\n> ⚠️ **素材覆盖说明**"]
+        for note in notes:
+            lines.append(f"> - {note}")
+        lines.append("> 结论仅供参考，建议结合一手数据或多源交叉验证后使用。\n")
+        self.chapters_md[0] = "\n".join(lines) + self.chapters_md[0]
+        logger.info(f"[素材覆盖] 已插入报告开头: {'；'.join(notes)}")
 
     def _insert_quality_gate_notice(self, gate):
         """质量门禁未通过时，在报告开头插入可追溯说明（不阻断交付）。"""
         lines = [f"\n\n> ⚠️ **质量门禁未通过**：{gate.summary}"]
         for c in gate.unsupported_claims[:5]:
             lines.append(f"> - 无来源/推断：{c.field_name} = {str(c.value)[:60]}")
+        for c in getattr(gate, "number_miss_claims", [])[:5]:
+            lines.append(
+                f"> - 数值未命中：{c.field_name} = {str(c.value)[:60]}"
+                f"（{c.source_id or '引用'}，素材原文未找到该数值）")
         for c in gate.disputed_claims[:3]:
             lines.append(f"> - 被质疑：{c.field_name} = {str(c.value)[:60]}")
         lines.append("> 以上声明请结合原文来源复核。\n")
@@ -3983,6 +3985,19 @@ class FusionResearchBot:
             "cite_density_per_para": cite_density,
             "chapter_balance": balance_score,
         }
+
+        # 引用支持率：有来源且数值能在素材原文核验的声明占比
+        ledger = getattr(self, "claim_ledger", None)
+        if ledger:
+            all_claims = ledger.get_all_claims()
+            if all_claims:
+                supported_n = sum(
+                    1 for c in all_claims
+                    if getattr(c.status, "value", c.status) == "supported")
+                ratio = round(supported_n / len(all_claims), 2)
+                result["citation_support_ratio"] = ratio
+                result["citation_support_ok"] = ratio >= float(
+                    self.cfg.get("quality_min_support_ratio", 0.6))
         
         if self.cfg.get("quality_dimensions", "basic") == "full":
             try:
@@ -4012,6 +4027,8 @@ class FusionResearchBot:
         if result["source_coverage_ok"]: scores.append(1.0)
         else: scores.append(0.5)
         scores.append(max(0, result["chapter_balance"]))
+        if "citation_support_ratio" in result:
+            scores.append(max(0.0, result["citation_support_ratio"]))
         if "logic_score" in result:
             scores.append(float(result["logic_score"]))
         result["overall_quality"] = round(sum(scores) / len(scores), 2) if scores else 0.0
@@ -4020,6 +4037,7 @@ class FusionResearchBot:
             f"[质量评分] 综合{result['overall_quality']:.0%} | "
             f"数据密度:{result['num_density_per_1k']}/千字 | "
             f"来源:{result['unique_sources']}个 | "
+            f"支持率:{result.get('citation_support_ratio', '—')} | "
             f"均衡度:{result['chapter_balance']:.0%}"
         )
         return result
@@ -5032,10 +5050,17 @@ class FusionResearchBot:
         # 数据防坑检查（单位搞混/趋势造假/张冠李戴/跨章一致性）
         self._last_data_trap = self._data_trap_check()
 
-        # 来源多样性硬线 + 数据受限声明
+        # 来源多样性 + 批次预算 + AI 补章：合并成一条素材覆盖说明
         source_diversity = self._check_source_diversity()
+        coverage_notes = []
         if source_diversity.get("data_limited"):
-            self._insert_data_limited_notice()
+            coverage_notes.append(source_diversity.get("reason") or "来源多样性不足")
+        if getattr(self, "_batch_budget_skipped", False):
+            coverage_notes.append("批次搜索因预算不足被跳过")
+        ai_chapters = sum(1 for ch in self.chapters_md if "【AI训练知识】" in ch)
+        if ai_chapters:
+            coverage_notes.append(f"{ai_chapters} 个章节由 AI 训练知识补写，无外部来源")
+        self._insert_coverage_notice(coverage_notes)
 
         # 质量自动评分
         quality_report = self._quality_scorer()
@@ -5053,6 +5078,7 @@ class FusionResearchBot:
                         meta={
                             "passed": gate.passed,
                             "unsupported": len(gate.unsupported_claims),
+                            "number_miss": len(gate.number_miss_claims),
                             "disputed": len(gate.disputed_claims),
                             "stale": len(gate.stale_claims),
                         },
