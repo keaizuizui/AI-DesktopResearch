@@ -241,7 +241,7 @@ python cli.py run "分析中国无糖茶市场" --dry-run
 python cli.py eval --limit 3
 ```
 
-`pip install -e .` 后可用 `xiaozui-research` 代替 `python cli.py`。非 editable 安装需要保留 `调研工具` 目录，或通过 `XIAOZUI_RESEARCH_DIR` 指定路径。评测指标口径见 [eval/README.md](eval/README.md)。
+`pip install -e .` 后可用 `xiaozui-research` 代替 `python cli.py`。当前只支持 editable 安装；非 editable 安装不会带上 `调研工具` 源码目录，需要通过 `XIAOZUI_RESEARCH_DIR` 指向源码位置。评测指标口径见 [eval/README.md](eval/README.md)。
 
 ### 5. 可选服务
 

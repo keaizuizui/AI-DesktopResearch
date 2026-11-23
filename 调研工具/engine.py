@@ -3938,6 +3938,11 @@ class FusionResearchBot:
                 f"（{c.source_id or '引用'}，素材原文未找到该数值）")
         for c in gate.disputed_claims[:3]:
             lines.append(f"> - 被质疑：{c.field_name} = {str(c.value)[:60]}")
+        quality_report = getattr(self, "_last_quality_report", {}) or {}
+        if quality_report.get("citation_support_ok") is False:
+            lines.append(
+                f"> - 引用支持率偏低：{quality_report.get('citation_support_ratio')}"
+                f"（低于 {self.cfg.get('quality_min_support_ratio', 0.6)}）")
         lines.append("> 以上声明请结合原文来源复核。\n")
         if self.chapters_md:
             self.chapters_md[0] = "\n".join(lines) + self.chapters_md[0]
@@ -3987,15 +3992,18 @@ class FusionResearchBot:
             "chapter_balance": balance_score,
         }
 
-        # 引用支持率：有来源且数值能在素材原文核验的声明占比
+        # 引用支持率：只统计报告正文声明，避免搜索阶段的素材标题声明稀释分母
         ledger = getattr(self, "claim_ledger", None)
         if ledger:
-            all_claims = ledger.get_all_claims()
-            if all_claims:
+            report_claims = [
+                c for c in ledger.get_all_claims()
+                if str(getattr(c, "writer", "")).startswith("report.")
+            ]
+            if report_claims:
                 supported_n = sum(
-                    1 for c in all_claims
+                    1 for c in report_claims
                     if getattr(c.status, "value", c.status) == "supported")
-                ratio = round(supported_n / len(all_claims), 2)
+                ratio = round(supported_n / len(report_claims), 2)
                 result["citation_support_ratio"] = ratio
                 result["citation_support_ok"] = ratio >= float(
                     self.cfg.get("quality_min_support_ratio", 0.6))

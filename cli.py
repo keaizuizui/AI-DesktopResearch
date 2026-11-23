@@ -19,7 +19,9 @@ RESEARCH_DIR = ROOT / "调研工具"
 if not RESEARCH_DIR.exists():
     fallback = os.environ.get("XIAOZUI_RESEARCH_DIR", "")
     if not fallback:
-        raise SystemExit("找不到调研工具目录，请设置 XIAOZUI_RESEARCH_DIR")
+        raise SystemExit(
+            "找不到调研工具目录：请在仓库根目录运行 python cli.py，"
+            "或设置 XIAOZUI_RESEARCH_DIR 指向源码目录")
     RESEARCH_DIR = Path(fallback)
 sys.path.insert(0, str(RESEARCH_DIR))
 
@@ -181,9 +183,9 @@ def cmd_eval(args) -> int:
     for q in questions:
         qid = q.get("id") or f"Q{len(results) + 1}"
         local_cfg = dict(cfg)
-        if q.get("pages"):
+        if q.get("pages") and not args.pages:
             local_cfg["max_pages"] = int(q["pages"])
-        if q.get("mode"):
+        if q.get("mode") and not args.mode:
             local_cfg["v15_mode_forced"] = q["mode"] == "deep"
         print(f"[评测] {qid} 开始：{q.get('task')}")
         try:

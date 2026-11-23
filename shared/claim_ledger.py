@@ -425,8 +425,9 @@ class EventLog:
 # 便捷函数：LLM 声明提取
 # ============================================================
 
-_NUM_TOKEN_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(亿|万|千)?\s*(%|％|元|美元|人民币|港元)?')
-_UNIT_SCALE = {"千": 1e3, "万": 1e4, "亿": 1e8}
+_NUM_TOKEN_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(万亿|千亿|百亿|亿|万|千)?\s*(%|％|元|美元|人民币|港元)?')
+_UNIT_SCALE = {"百亿": 1e10, "千亿": 1e11, "万亿": 1e12, "千": 1e3, "万": 1e4, "亿": 1e8}
 
 
 def _normalize_numeric_text(text: str) -> str:
@@ -450,20 +451,11 @@ def _extract_number_tokens(text: str) -> List[tuple]:
     return tokens
 
 
-def _numbers_match(claim_value: str, material_text: str) -> bool:
-    """声明里的数值是否能在素材原文中找到（2% 相对误差）。
-
-    返回 True 的情况：
-    - 声明不含数值（无法机械化比对，不误杀定性结论）
-    - 素材正文为空（无法比对）
-    - 所有数值都能在素材中找到同量级、误差内的对应值
-    """
+def _numbers_match_tokens(claim_value: str, mat_tokens: List[tuple]) -> bool:
+    """声明里的数值是否都能在素材 token 列表中找到（2% 相对误差）。"""
     claim_tokens = _extract_number_tokens(claim_value)
     if not claim_tokens:
         return True
-    if not (material_text or "").strip():
-        return True
-    mat_tokens = _extract_number_tokens(material_text)
     if not mat_tokens:
         return False
 
@@ -486,6 +478,19 @@ def _numbers_match(claim_value: str, material_text: str) -> bool:
         if not hit:
             return False
     return True
+
+
+def _numbers_match(claim_value: str, material_text: str) -> bool:
+    """声明里的数值是否能在素材原文中找到（2% 相对误差）。
+
+    返回 True 的情况：
+    - 声明不含数值（无法机械化比对，不误杀定性结论）
+    - 素材正文为空（无法比对）
+    - 所有数值都能在素材中找到同量级、误差内的对应值
+    """
+    if not (material_text or "").strip():
+        return True
+    return _numbers_match_tokens(claim_value, _extract_number_tokens(material_text))
 
 
 _GENERIC_METRIC_PATTERNS = [
@@ -550,13 +555,21 @@ def extract_claims_from_llm(
     claims: List[Claim] = []
     seen = set()
 
+    _token_cache: Dict[int, List[tuple]] = {}
+
     def _register(field: str, value: str, claim_type: ClaimType, sentence: str, origin: str):
         idx, source, tier, nature, title, content = _claim_source_from_citation(
             sentence, materials or [])
         number_miss = False
         if idx and source and "越界" not in source and "未加载" not in source:
             # 编号有效只是第一步：数值还必须能在素材原文里找到
-            if _numbers_match(value, content):
+            if not (content or "").strip():
+                number_ok = True
+            else:
+                if idx not in _token_cache:
+                    _token_cache[idx] = _extract_number_tokens(content)
+                number_ok = _numbers_match_tokens(value, _token_cache[idx])
+            if number_ok:
                 status = ClaimStatus.SUPPORTED
             else:
                 status = ClaimStatus.INFERRED
@@ -584,29 +597,12 @@ def extract_claims_from_llm(
             },
         ))
 
-    # 1) JSON 键值（通用：不再限制品牌调研字段）
-    try:
-        json_match = re.search(r'\{.*\}', text, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-            if isinstance(data, dict):
-                for key, val in data.items():
-                    if len(claims) >= max_claims:
-                        break
-                    sval = str(val).strip() if val is not None else ""
-                    if not sval or len(sval) > 200:
-                        continue
-                    field = f"report_field:{writer}:{key}"
-                    if field in seen:
-                        continue
-                    seen.add(field)
-                    ctype = ClaimType.METRIC if re.search(r'\d', sval) else ClaimType.FACT
-                    _register(field, sval, ctype, sval, "json")
-    except (json.JSONDecodeError, TypeError, re.error):
-        pass
-
-    # 2) 正文数值指标（金额、百分比、数量、排名）
-    for sentence in re.split(r'(?<=[。！？；\n])', text):
+    # 1) 正文数值指标（先剔除 JSON 块，避免 JSON 内容被当正文重复提取）
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    body = text
+    if json_match:
+        body = text[:json_match.start()] + text[json_match.end():]
+    for sentence in re.split(r'(?<=[。！？；\n])', body):
         if len(claims) >= max_claims:
             break
         if not sentence.strip():
@@ -626,5 +622,26 @@ def extract_claims_from_llm(
                           ClaimType.METRIC, sentence, "text")
             if len(claims) >= max_claims:
                 break
+
+    # 2) JSON 键值（通用：不再限制品牌调研字段）
+    try:
+        if json_match:
+            data = json.loads(json_match.group())
+            if isinstance(data, dict):
+                for key, val in data.items():
+                    if len(claims) >= max_claims:
+                        break
+                    sval = str(val).strip() if val is not None else ""
+                    if not sval or len(sval) > 200:
+                        continue
+                    field = f"report_field:{writer}:{key}"
+                    if field in seen or sval in seen:
+                        continue
+                    seen.add(field)
+                    seen.add(sval)
+                    ctype = ClaimType.METRIC if re.search(r'\d', sval) else ClaimType.FACT
+                    _register(field, sval, ctype, sval, "json")
+    except (json.JSONDecodeError, TypeError, re.error):
+        pass
 
     return claims

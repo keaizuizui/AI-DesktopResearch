@@ -30,4 +30,5 @@ dependencies = [
 xiaozui-research = "cli:main"
 
 [tool.setuptools]
+# CLI 依赖仓库内的 调研工具 目录，当前仅支持 pip install -e .
 py-modules = ["cli"]
