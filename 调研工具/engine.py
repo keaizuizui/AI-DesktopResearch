@@ -249,6 +249,7 @@ class FusionResearchBot:
         self.chapter_materials: Dict[int, List[int]] = {}
         self._supplement_triggered: bool = False
         self._batch_budget_skipped: bool = False  # 批次搜索因预算不足被跳过
+        self._coverage_notes: List[str] = []  # 素材覆盖不足信号，交付层用于封面标记
         self.global_context = GlobalContext()  # 
 
         # 素材分层注入 — 聚类器 + 综合器
@@ -5060,6 +5061,7 @@ class FusionResearchBot:
         ai_chapters = sum(1 for ch in self.chapters_md if "【AI训练知识】" in ch)
         if ai_chapters:
             coverage_notes.append(f"{ai_chapters} 个章节由 AI 训练知识补写，无外部来源")
+        self._coverage_notes = coverage_notes
         self._insert_coverage_notice(coverage_notes)
 
         # 质量自动评分

@@ -736,6 +736,8 @@ AI 不可以：
 | 交付物 | `调研工具/deliverables.py`、`main.py` 的 `run_bot()` |
 | 任务状态与恢复 | `调研工具/task_state.py` |
 | 声明账本与质量门禁 | `shared/claim_ledger.py` |
+| 无 GUI 运行与评测 | `cli.py`、`eval/README.md`、`eval/questions.json` |
+| 依赖与命令入口 | `pyproject.toml` |
 
 ### 11.6 模块清单
 

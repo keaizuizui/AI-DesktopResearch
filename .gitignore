@@ -36,6 +36,7 @@ test_report.html
 test_report.json
 test_result.json
 test_engine_report.json
+eval/results/
 
 # 系统与编辑器
 .DS_Store

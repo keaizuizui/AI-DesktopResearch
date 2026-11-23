@@ -865,6 +865,7 @@ class ResearchGUI:
                 final_path = compiler.compile_word(
                     self.bot.report_title, self._chapters_md, self._action_plan,
                     source_appendix=self.bot._get_source_appendix() if hasattr(self.bot, '_get_source_appendix') else "",
+                    coverage_notes=getattr(self.bot, "_coverage_notes", None),
                 )
                 # 同步产出精炼版报告
                 gui_mode = self.mode_var.get()

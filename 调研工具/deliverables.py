@@ -1346,8 +1346,10 @@ iframe{{border:none;border-radius:4px}}</style>
         logger.info(f"[仪表盘] {dash_path}")
 
     def compile_word(self, report_title: str, chapters_md: List[str], action_plan: str,
-                     task_id: str = "", source_appendix: str = "") -> str:
+                     task_id: str = "", source_appendix: str = "",
+                     coverage_notes: List[str] = None) -> str:
         logger.info("[组装 Word 文档 ]")
+        coverage_text = "；".join(coverage_notes or [])
         # 按任务ID组织输出目录
         if task_id:
             task_dir = os.path.join(self.output_dir, "cache", task_id)
@@ -1366,6 +1368,8 @@ iframe{{border:none;border-radius:4px}}</style>
         # 封面页
         md_parts.append(f"# {report_title}\n")
         md_parts.append("**基于互联网公开信息的自动化桌面研究报告**\n")
+        if coverage_text:
+            md_parts.append(f"\n> ⚠️ **素材覆盖不足**：{coverage_text}\n")
         md_parts.append("")
 
         # TLDR
@@ -1472,6 +1476,16 @@ iframe{{border:none;border-radius:4px}}</style>
             sub_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
             sub_run.font.name = "微软雅黑"
             sub_run._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+            if coverage_text:
+                warn = doc.add_paragraph()
+                warn.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                warn_run = warn.add_run(f"⚠️ 素材覆盖不足：{coverage_text}")
+                warn_run.font.size = Pt(10)
+                warn_run.bold = True
+                warn_run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+                warn_run.font.name = "微软雅黑"
+                warn_run._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
 
             doc.add_paragraph()
 

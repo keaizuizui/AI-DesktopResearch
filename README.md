@@ -228,6 +228,21 @@ python 调研工具\main.py
 
 在左侧输入调研需求，选择页数和报告模式，点击【开始生成】。后续按界面提示完成澄清回答、计划确认和骨架确认。
 
+命令行运行（无 GUI）：
+
+```powershell
+# 单个任务
+python cli.py run "分析中国无糖茶市场" --pages 30
+
+# 只校验配置，不调用模型
+python cli.py run "分析中国无糖茶市场" --dry-run
+
+# 评测题库（先跑 3 题）
+python cli.py eval --limit 3
+```
+
+`pip install -e .` 后可用 `xiaozui-research` 代替 `python cli.py`。非 editable 安装需要保留 `调研工具` 目录，或通过 `XIAOZUI_RESEARCH_DIR` 指定路径。评测指标口径见 [eval/README.md](eval/README.md)。
+
 ### 5. 可选服务
 
 | 服务 | 作用 | 不安装时 |
@@ -365,6 +380,9 @@ AI-DesktopResearch/
 │  └─ search/                     # 适配器、信源分级、缓存、打分
 ├─ gptr_service/                  # 9 个文件，约 1.4k 行：FastAPI + 队列 + worker + 健康检查
 ├─ third_party/gpt_researcher/    # 110 个文件，约 11k 行（带补丁）
+├─ cli.py                         # 无 GUI 入口：run / eval 两个子命令
+├─ eval/                          # 评测题库、指标口径、运行入口
+├─ pyproject.toml                # 依赖与 xiaozui-research 命令入口
 ├─ docs/                          # Wiki、全链路、修复记录
 └─ requirements-research.txt
 ```
@@ -397,6 +415,8 @@ python -m unittest test_audit_fixes -v
 ```
 
 四套测试默认使用 mock 数据，不调用真实 API、不启动 Ollama、不访问网络。完整测试和真实端到端调研需要配置 Key 与本机服务。
+
+评测脚手架与单元测试分开：题库、指标口径和运行方式见 [eval/README.md](eval/README.md)。默认先跑 2–3 题验证链路，不承诺开箱即跑完 20 题。
 
 ## 能力边界
 
