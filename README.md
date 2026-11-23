@@ -416,4 +416,6 @@ python -m unittest test_audit_fixes -v
 
 ## License
 
-[MIT](LICENSE)
+[AI-DesktopResearch License 1.0](LICENSE)
+
+允许个人和企业内部使用、修改与分发；禁止将本项目或其修改版作为商业产品对外销售，或作为付费服务、SaaS、托管服务对外提供。使用本工具生成的报告与数据归使用者所有。`third_party/` 下的代码遵循其原始开源许可证。
