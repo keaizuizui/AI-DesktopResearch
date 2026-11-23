@@ -348,7 +348,12 @@ class FusionResearchBot:
         from shared.claim_ledger import extract_claims_from_llm, ClaimStatus
 
         total_extracted = 0
+        skipped_ai = 0
         for i, chapter in enumerate(self.chapters_md):
+            # AI 训练知识章节没有外部来源，不计入无来源声明，避免门禁误伤
+            if "【AI训练知识】" in chapter:
+                skipped_ai += 1
+                continue
             claims = extract_claims_from_llm(
                 text=chapter,
                 writer=f"report.chapter_{i}",
@@ -359,6 +364,9 @@ class FusionResearchBot:
             )
             # extract_claims_from_llm 内部已注册到 ledger
             total_extracted += len(claims)
+
+        if skipped_ai:
+            logger.info(f"[ClaimLedger] 跳过 {skipped_ai} 个 AI 训练知识章节（无外部来源，不计入门禁）")
 
         if total_extracted > 0 and self.event_log:
             self.event_log.log(
@@ -4525,7 +4533,8 @@ class FusionResearchBot:
             self._extract_report_claims()
         except Exception as e:
             logger.warning(f"[ClaimLedger] 提取跳过: {e}")
-        self._post_generation_self_check()
+        # 与常规路径统一收尾：自检、数据防坑、来源多样性、质量评分、确定性门禁
+        await self._run_stage("quality", lambda: self._step_quality_check(), critical=False)
         logger.info(f"流水线完成，共{len(self.chapters_md)}章")
 
     def _append_v15_appendix(self):
