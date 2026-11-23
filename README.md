@@ -379,7 +379,7 @@ AI-DesktopResearch/
 │  ├─ prompt_security.py          # 系统提示安全后缀
 │  └─ search/                     # 适配器、信源分级、缓存、打分
 ├─ gptr_service/                  # 9 个文件，约 1.4k 行：FastAPI + 队列 + worker + 健康检查
-├─ third_party/gpt_researcher/    # 110 个文件，约 11k 行（带补丁）
+├─ third_party/gpt_researcher/    # 110 个文件，约 11k 行（带补丁，升级步骤见 UPSTREAM.md）
 ├─ cli.py                         # 无 GUI 入口：run / eval 两个子命令
 ├─ eval/                          # 评测题库、指标口径、运行入口
 ├─ pyproject.toml                # 依赖与 xiaozui-research 命令入口
