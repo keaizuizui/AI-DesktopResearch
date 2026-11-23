@@ -31,6 +31,7 @@ Claim Ledger — 声明账本（借鉴 BriefLoop）
 
 import time
 import json
+import re
 import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
@@ -92,6 +93,7 @@ class Claim:
             "source_date": self.source_date,
             "writer": self.writer,
             "created_at": self.created_at,
+            "meta": self.meta,
         }
 
 
@@ -134,6 +136,7 @@ class ClaimLedger:
         source_date: str = "",
         writer: str = "",
         status: ClaimStatus = None,
+        meta: Dict = None,
     ) -> Claim:
         """注册一个声明
 
@@ -166,6 +169,7 @@ class ClaimLedger:
             source_id=source_id,
             source_date=source_date,
             writer=writer,
+            meta=meta or {},
         )
 
         self._claims[claim_id] = claim
@@ -249,6 +253,7 @@ class ClaimLedger:
                 source_date=c_dict.get("source_date", ""),
                 writer=c_dict.get("writer", ""),
                 created_at=c_dict.get("created_at", time.time()),
+                meta=c_dict.get("meta", {}),
             )
             ledger._claims[claim.claim_id] = claim
             ledger._field_index[claim.field_name] = claim.claim_id
@@ -269,9 +274,9 @@ class QualityGate:
         self.ledger = ledger
 
     def find_unsupported(self) -> List[Claim]:
-        """找出所有无来源支持的声明"""
+        """找出所有无直接来源的声明（含推断声明）"""
         return [c for c in self.ledger.get_all_claims()
-                if c.status == ClaimStatus.UNSUPPORTED]
+                if c.status in (ClaimStatus.UNSUPPORTED, ClaimStatus.INFERRED)]
 
     def find_stale(self, max_age_days: int = 365) -> List[Claim]:
         """找出来源过期的声明"""
@@ -301,14 +306,14 @@ class QualityGate:
 
         warnings = []
         if unsupported:
-            warnings.append(f"有 {len(unsupported)} 个声明无来源支持")
+            warnings.append(f"有 {len(unsupported)} 个声明无直接来源（含推断）")
         if stale:
             warnings.append(f"有 {len(stale)} 个声明来源可能过时")
         if disputed:
             warnings.append(f"有 {len(disputed)} 个声明被后续校验质疑")
 
         passed = len(unsupported) == 0 and len(disputed) == 0
-        summary = "通过" if passed else f"不通过（{len(unsupported)} 无来源, {len(disputed)} 被质疑）"
+        summary = "通过" if passed else f"不通过（{len(unsupported)} 无直接来源, {len(disputed)} 被质疑）"
 
         return GateResult(
             passed=passed,
@@ -319,15 +324,20 @@ class QualityGate:
             summary=summary,
         )
 
-    def build_source_appendix(self) -> str:
-        """构建来源追溯表（按来源去重，避免逐条声明撑大报告篇幅）"""
+    def build_source_appendix(self, limit: int = 50) -> str:
+        """构建来源追溯表（按来源去重）。
+
+        limit=0 表示不截断；默认 50，可通过 source_appendix_limit 调整。
+        """
         claims = self.ledger.get_all_claims(ClaimStatus.SUPPORTED)
         if not claims:
             return "（无已支持的声明）"
 
         sources = {}
         for c in sorted(claims, key=lambda x: x.created_at):
-            title = (c.value or c.field_name or "").strip()
+            title = (c.meta.get("source_title") or "").strip()
+            if not title:
+                title = (c.value or c.field_name or "").strip()
             url = (c.source or "").strip()
             key = c.source_id or url or title
             if not key or key in sources:
@@ -339,12 +349,17 @@ class QualityGate:
             s = (text or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
             return s[:limit] if limit else s
 
+        items = list(sources.items())
+        shown = items[:limit] if limit and limit > 0 else items
         lines = ["| 序号 | 来源 | 链接 |",
                  "|------|------|------|"]
-        for i, (_, (title, url)) in enumerate(list(sources.items())[:12], 1):
+        for i, (_, (title, url)) in enumerate(shown, 1):
             lines.append(f"| {i} | {_cell(title, 80) or '—'} | {_cell(url) or '—'} |")
-        if len(sources) > 12:
-            lines.append(f"\n共 {len(sources)} 个来源，仅列前 12 个。")
+        if len(items) > len(shown):
+            lines.append(
+                f"\n共 {len(items)} 个来源，已列前 {len(shown)} 个；"
+                "可通过 source_appendix_limit 调整上限（0=全部）。"
+            )
 
         return "\n".join(lines)
 
@@ -390,84 +405,131 @@ class EventLog:
 # 便捷函数：LLM 声明提取
 # ============================================================
 
+_GENERIC_METRIC_PATTERNS = [
+    # 金额（含亿/万/千与常见货币）
+    r'(?:约|近|超过|不足|超|突破|达到)?\s*\d+(?:\.\d+)?\s*(?:亿|万|千)?\s*(?:元|美元|人民币|港元)',
+    # 百分比与百分比区间
+    r'\d+(?:\.\d+)?\s*%\s*(?:[-~～至—–]\s*\d+(?:\.\d+)?\s*%)?',
+    # 数量、门店、人群、时长（不含“年”，避免把年份当声明）
+    r'\d+(?:\.\d+)?\s*(?:亿|万|千)?\s*(?:家|人|个|台|店|门店|所|例|项|倍|小时|天|个月|岁)',
+    # 排名
+    r'第\s*\d+\s*[名位]',
+]
+
+
+def _claim_source_from_citation(sentence: str, materials: List[Any]):
+    """从句子里的 [n] 解析素材来源，返回 (编号, URL, 等级, 声明性质, 标题)。"""
+    m = re.search(r'\[(\d+)\]', sentence or "")
+    if not m:
+        return 0, "", "", "", ""
+    idx = int(m.group(1))
+    if not materials:
+        return idx, f"引用编号[{idx}]（素材表未加载）", "", "", ""
+    if idx < 1 or idx > len(materials):
+        return idx, f"引用编号[{idx}]越界", "", "", ""
+    mat = materials[idx - 1]
+    if isinstance(mat, dict):
+        url = mat.get("url", "") or mat.get("title", "")
+        tier = mat.get("tier", "") or mat.get("grade", "")
+        nature = mat.get("claim_nature", "")
+        title = mat.get("title", "")
+    else:
+        url = getattr(mat, "url", "") or getattr(mat, "title", "")
+        tier = getattr(mat, "tier", "") or getattr(mat, "grade", "")
+        nature = getattr(mat, "claim_nature", "")
+        title = getattr(mat, "title", "")
+    return (idx, str(url or ""), str(getattr(tier, "value", tier) or ""),
+            str(nature or ""), str(title or ""))
+
+
 def extract_claims_from_llm(
     text: str,
     writer: str,
     default_source: str = "",
     ledger: ClaimLedger = None,
+    materials: List[Any] = None,
+    max_claims: int = 30,
 ) -> List[Claim]:
-    """从 LLM 输出中提取关键声明并注册到账本
+    """从 LLM 输出中提取关键声明并注册到账本。
 
-    智能提取：尝试解析 JSON 中的声明，或从文本中提取关键指标。
-
-    Args:
-        text: LLM 输出文本
-        writer: 写入者标识（节点ID）
-        default_source: 默认来源描述（如"LLM生成"）
-        ledger: 可选的账本实例（如果不传则创建新的）
-
-    Returns:
-        提取的声明列表
+    声明是否 SUPPORTED 只取决于能否绑定到具体来源：
+    - 句子里有有效 [n] → 绑定 all_materials[n-1]，SUPPORTED
+    - 没有 [n] 或编号越界 → UNSUPPORTED
+    - JSON 键值同理，不再默认 SUPPORTED
     """
     if ledger is None:
         ledger = ClaimLedger()
 
-    claims = []
+    claims: List[Claim] = []
+    seen = set()
 
-    # 1. 尝试解析 JSON
+    def _register(field: str, value: str, claim_type: ClaimType, sentence: str, origin: str):
+        idx, source, tier, nature, title = _claim_source_from_citation(sentence, materials or [])
+        if idx and source and "越界" not in source and "未加载" not in source:
+            status = ClaimStatus.SUPPORTED
+            source_id = f"material:{idx}"
+        else:
+            status = ClaimStatus.UNSUPPORTED
+            source_id = ""
+            source = source or default_source or "报告未标注引用"
+        claims.append(ledger.register_claim(
+            field_name=field,
+            value=value,
+            claim_type=claim_type,
+            source=source,
+            source_id=source_id,
+            writer=writer,
+            status=status,
+            meta={
+                "citation_index": idx,
+                "source_grade": tier,
+                "claim_nature": nature,
+                "source_title": title,
+                "extracted_from": origin,
+            },
+        ))
+
+    # 1) JSON 键值（通用：不再限制品牌调研字段）
     try:
-        import re
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
-            # 遍历 JSON 键值，注册有值的声明
-            key_source_map = {
-                "market_size": ("市场规模", ClaimType.METRIC),
-                "growth_rate": ("增长率", ClaimType.METRIC),
-                "price_range": ("价格区间", ClaimType.METRIC),
-                "life_cycle_stage": ("品牌阶段", ClaimType.OPINION),
-                "product_brand_stage": ("产品品牌阶段", ClaimType.OPINION),
-                "category_brand_stage": ("品类品牌阶段", ClaimType.OPINION),
-                "overall_stage": ("综合判定", ClaimType.OPINION),
-                "core_conflict": ("核心冲突", ClaimType.OPINION),
-                "conflict_intensity": ("冲突强度", ClaimType.OPINION),
-                "brand_name": ("品牌名称", ClaimType.ENTITY),
-                "category": ("产品品类", ClaimType.ENTITY),
-                "target_market": ("目标市场", ClaimType.ENTITY),
-                "competitors": ("竞品", ClaimType.ENTITY),
-                "business_model": ("商业模式", ClaimType.OPINION),
-            }
-            for key, (field_name, claim_type) in key_source_map.items():
-                val = data.get(key)
-                if val and str(val).strip():
-                    claim = ledger.register_claim(
-                        field_name=field_name,
-                        value=str(val),
-                        claim_type=claim_type,
-                        source=default_source or "LLM推断",
-                        writer=writer,
-                        status=ClaimStatus.INFERRED if not default_source else ClaimStatus.SUPPORTED,
-                    )
-                    claims.append(claim)
-    except (json.JSONDecodeError, re.error):
+            if isinstance(data, dict):
+                for key, val in data.items():
+                    if len(claims) >= max_claims:
+                        break
+                    sval = str(val).strip() if val is not None else ""
+                    if not sval or len(sval) > 200:
+                        continue
+                    field = f"report_field:{writer}:{key}"
+                    if field in seen:
+                        continue
+                    seen.add(field)
+                    ctype = ClaimType.METRIC if re.search(r'\d', sval) else ClaimType.FACT
+                    _register(field, sval, ctype, sval, "json")
+    except (json.JSONDecodeError, TypeError, re.error):
         pass
 
-    # 2. 从文本中提取数字指标（如"2800亿元"、"6.5%"）
-    import re
-    metric_patterns = [
-        (r'(\d+[\d,.]*\s*(?:亿|万|%)?)\s*(?:元|美元|人民币)', "数值指标"),
-    ]
-    for pattern, label in metric_patterns:
-        matches = re.findall(pattern, text)
-        for match in matches[:3]:
-            claim = ledger.register_claim(
-                field_name=f"extracted_metric:{label}",
-                value=match,
-                claim_type=ClaimType.METRIC,
-                source=default_source or "LLM文本提取",
-                writer=writer,
-                status=ClaimStatus.INFERRED if not default_source else ClaimStatus.SUPPORTED,
-            )
-            claims.append(claim)
+    # 2) 正文数值指标（金额、百分比、数量、排名）
+    for sentence in re.split(r'(?<=[。！？；\n])', text):
+        if len(claims) >= max_claims:
+            break
+        if not sentence.strip():
+            continue
+        clean = re.sub(r'\[\d+\]', '', sentence)
+        for pattern in _GENERIC_METRIC_PATTERNS:
+            for match in re.findall(pattern, clean):
+                if len(claims) >= max_claims:
+                    break
+                value = match.strip()
+                if not value or value in seen:
+                    continue
+                if re.fullmatch(r'20\d{2}\s*年?', value):
+                    continue
+                seen.add(value)
+                _register(f"report_metric:{writer}:{len(claims)}", value,
+                          ClaimType.METRIC, sentence, "text")
+            if len(claims) >= max_claims:
+                break
 
     return claims

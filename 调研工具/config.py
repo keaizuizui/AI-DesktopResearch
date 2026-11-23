@@ -521,6 +521,8 @@ DEFAULT_CONFIG = {
     # 功能5: 质量自动评分（多维报告质量评估）
     #   建议：本地✅ | 常规✅ | 深度✅ — 三档全开，basic模式零LLM成本
     "enable_quality_scoring": True,
+    "source_appendix_limit": 50,               # 来源追溯表最多列多少条；0=全部
+    "reference_list_limit": 50,                # 参考文献最多列多少条；0=全部
     "quality_dimensions": "basic",             # basic(纯统计:数据密度/来源覆盖/引用完整性) / full(+LLM逻辑一致性)
     "quality_min_data_density": 3.0,           # 数据密度最低标准：每千字至少N个数字
     "quality_min_source_coverage": 3,          # 来源覆盖度最低标准：至少N个不同引用源

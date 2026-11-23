@@ -290,6 +290,15 @@ class FusionResearchBot:
             if not title:
                 continue
 
+            grade = getattr(m, 'tier', '') or getattr(m, 'grade', '')
+            if hasattr(grade, 'value'):
+                grade = grade.value
+            source_meta = {
+                "source_grade": str(grade or ""),
+                "claim_nature": str(getattr(m, 'claim_nature', '') or ""),
+                "source_group": str(getattr(m, 'source_group', '') or ""),
+            }
+
             # 注册标题声明（来源为搜索结果URL）
             source_label = url if url else "搜索引擎结果"
             self.claim_ledger.register_claim(
@@ -300,6 +309,7 @@ class FusionResearchBot:
                 source_id=url,
                 source_date=published_date,
                 writer="search_engine",
+                meta=dict(source_meta),
             )
 
             # 如果有发布时间，也注册
@@ -311,6 +321,7 @@ class FusionResearchBot:
                     source=source_label,
                     source_id=url,
                     writer="search_engine",
+                    meta=dict(source_meta),
                 )
 
             registered += 1
@@ -341,8 +352,10 @@ class FusionResearchBot:
             claims = extract_claims_from_llm(
                 text=chapter,
                 writer=f"report.chapter_{i}",
-                default_source="基于搜索结果推断",
+                default_source="报告未标注引用",
                 ledger=self.claim_ledger,
+                materials=self.all_materials,
+                max_claims=30,
             )
             # extract_claims_from_llm 内部已注册到 ledger
             total_extracted += len(claims)
@@ -359,7 +372,11 @@ class FusionResearchBot:
         """构建来源追溯表（Markdown 格式），附加到最终报告"""
         if not _HAS_CLAIM_LEDGER or not self._quality_gate:
             return ""
-        return self._quality_gate.build_source_appendix()
+        try:
+            limit = int(self.cfg.get("source_appendix_limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        return self._quality_gate.build_source_appendix(limit=limit)
 
     def _agent_call(self, role: str, messages, **kwargs) -> str:
         """
@@ -2166,6 +2183,14 @@ class FusionResearchBot:
                 or meta.get("source_type") == "promo")
 
     @staticmethod
+    def _material_ref_no(meta: dict, fallback: int) -> int:
+        """写作引用编号：优先用 all_materials 全局序号，保证与参考文献一致。"""
+        idx = meta.get("_mat_idx")
+        if isinstance(idx, int) and idx >= 0:
+            return idx + 1
+        return fallback + 1
+
+    @staticmethod
     def _claim_prefix(meta: dict) -> str:
         """企业自述素材打标，提示写作层不得当作行业数据使用。"""
         return "[企业自述] " if FusionResearchBot._is_self_published(meta) else ""
@@ -2479,7 +2504,7 @@ class FusionResearchBot:
                 )
 
             mt = "\n".join([
-                f"[{i+1}] {self._claim_prefix(m['meta'])}{m['meta'].get('title','')}"
+                f"[{self._material_ref_no(m['meta'], i)}] {self._claim_prefix(m['meta'])}{m['meta'].get('title','')}"
                 f"{self._merge_source_hint(m['meta'])}: "
                 f"{self._sanitize_skeleton(smart_truncate(self._material_text(m['meta']), 800))}"
                 for i, m in enumerate(tm)
@@ -2584,7 +2609,7 @@ class FusionResearchBot:
                         tm_new = self._merge_promo_sources(tm_new)
                         if len(tm_new) > len(tm):
                             mt_new = "\n".join([
-                                f"[{i+1}] {self._claim_prefix(m['meta'])}{m['meta'].get('title','')}"
+                                f"[{self._material_ref_no(m['meta'], i)}] {self._claim_prefix(m['meta'])}{m['meta'].get('title','')}"
                                 f"{self._merge_source_hint(m['meta'])}: "
                                 f"{self._sanitize_skeleton(smart_truncate(self._material_text(m['meta']), 800))}"
                                 for i, m in enumerate(tm_new)
@@ -3117,12 +3142,12 @@ class FusionResearchBot:
                 if m_url and m_url in core_urls:
                     # 核心素材：完整内容
                     core_parts.append(
-                        f"[C{i+1}] {self._claim_prefix(meta)}{title}{hint}: {self._sanitize_skeleton(smart_truncate(content, 2000))}"
+                        f"[{self._material_ref_no(meta, i)}] [核心] {self._claim_prefix(meta)}{title}{hint}: {self._sanitize_skeleton(smart_truncate(content, 2000))}"
                     )
                 else:
                     # 其余素材：180 字摘要（ContextCompressor 风格）
                     other_parts.append(
-                        f"[{i+1}] {self._claim_prefix(meta)}{title}{hint}: {self._sanitize_skeleton(smart_truncate(content, 180))}"
+                        f"[{self._material_ref_no(meta, i)}] {self._claim_prefix(meta)}{title}{hint}: {self._sanitize_skeleton(smart_truncate(content, 180))}"
                     )
 
             # 语义搜索补充：从全量素材中拉取 top 3
@@ -3136,7 +3161,7 @@ class FusionResearchBot:
                         sr_title = sr.get("meta", {}).get("title", "")
                         sr_content = sr.get("meta", {}).get("content", "")
                         semantic_parts.append(
-                            f"[S{si+1}] {self._claim_prefix(sr.get('meta', {}))}{sr_title}: {self._sanitize_skeleton(smart_truncate(sr_content, 800))}"
+                            f"[{self._material_ref_no(sr.get('meta', {}), si)}] [语义补充] {self._claim_prefix(sr.get('meta', {}))}{sr_title}: {self._sanitize_skeleton(smart_truncate(sr_content, 800))}"
                         )
 
             # 组装
@@ -3605,8 +3630,27 @@ class FusionResearchBot:
             "max_chapter_overlap": round(max_overlap * 100, 1),
             "overlap_ok": max_overlap < 0.3,
         }
-        result["all_ok"] = result["num_density_ok"] and result["cite_density_ok"] and result["overlap_ok"]
+        # 引用编号必须落在 1..参考文献实际列出的范围内
+        invalid_citations = []
+        try:
+            ref_limit = int(self.cfg.get("reference_list_limit", 50) or 0)
+        except (TypeError, ValueError):
+            ref_limit = 50
+        max_ref = (len(self.all_materials) if ref_limit <= 0
+                   else min(len(self.all_materials), ref_limit))
+        if self.all_materials and citations:
+            for n_str in set(citations):
+                n = int(n_str)
+                if n < 1 or n > max_ref:
+                    invalid_citations.append(n)
+        result["citation_count"] = len(citations)
+        result["invalid_citations"] = sorted(invalid_citations)
+        result["citation_ok"] = not invalid_citations
+        result["all_ok"] = (result["num_density_ok"] and result["cite_density_ok"]
+                            and result["overlap_ok"] and result["citation_ok"])
 
+        if result["invalid_citations"]:
+            logger.warning(f"[自检] ⚠️ 引用编号越界: {result['invalid_citations'][:10]}")
         logger.info(f"[自检] 数字密度:{result['num_density']}/千字 {'✅' if result['num_density_ok'] else '⚠️'} | "
                      f"引用密度:{result['cite_density']}/章 {'✅' if result['cite_density_ok'] else '⚠️'} | "
                      f"章间重叠:{result['max_chapter_overlap']}% {'✅' if result['overlap_ok'] else '⚠️'}")
@@ -3871,6 +3915,18 @@ class FusionResearchBot:
         if self.chapters_md:
             self.chapters_md[0] = notice + self.chapters_md[0]
             logger.info("[数据受限声明] 已插入报告开头")
+
+    def _insert_quality_gate_notice(self, gate):
+        """质量门禁未通过时，在报告开头插入可追溯说明（不阻断交付）。"""
+        lines = [f"\n\n> ⚠️ **质量门禁未通过**：{gate.summary}"]
+        for c in gate.unsupported_claims[:5]:
+            lines.append(f"> - 无来源/推断：{c.field_name} = {str(c.value)[:60]}")
+        for c in gate.disputed_claims[:3]:
+            lines.append(f"> - 被质疑：{c.field_name} = {str(c.value)[:60]}")
+        lines.append("> 以上声明请结合原文来源复核。\n")
+        if self.chapters_md:
+            self.chapters_md[0] = "\n".join(lines) + self.chapters_md[0]
+            logger.info("[质量门禁] 已在报告开头插入未通过说明")
 
     def _quality_scorer(self) -> Dict:
         """多维度报告质量自动评分。
@@ -4280,22 +4336,30 @@ class FusionResearchBot:
             return ""
 
     def _generate_reference_list(self) -> str:
-        """从all_materials生成参考文献列表。"""
+        """从all_materials生成参考文献列表，编号与正文引用保持一致。"""
         if not self.all_materials:
             return ""
-        seen = set()
+        try:
+            limit = int(self.cfg.get("reference_list_limit", 50) or 0)
+        except (TypeError, ValueError):
+            limit = 50
+        mats = self.all_materials[:limit] if limit > 0 else self.all_materials
+        seen = {}
         refs = []
-        for i, m in enumerate(self.all_materials, 1):
+        for i, m in enumerate(mats, 1):
             key = m.url.strip() if m.url else m.title.strip()
-            if key and key not in seen:
-                seen.add(key)
-                tier_tag = f"[{m.tier}]" if hasattr(m, 'tier') and m.tier else ""
-                refs.append(f"[{i}] **{m.title}** {tier_tag} \n    {m.url}  \n    来源: {m.source} | 评分: {m.llm_score:.0f}")
+            if key and key in seen:
+                refs.append(f"[{i}] 同 [{seen[key]}]")
+                continue
+            if key:
+                seen[key] = i
+            tier_tag = f"[{m.tier}]" if hasattr(m, 'tier') and m.tier else ""
+            refs.append(f"[{i}] **{m.title}** {tier_tag} \n    {m.url}  \n    来源: {m.source} | 评分: {m.llm_score:.0f}")
         if not refs:
             return ""
         md = "## 参考文献与数据来源\n\n"
-        md += "\n\n".join(refs[:50])
-        logger.info(f"[参考文献] 生成{len(refs[:50])}条来源")
+        md += "\n\n".join(refs)
+        logger.info(f"[参考文献] 生成{len(refs)}条来源")
         return md
 
     def _format_framework_for_display(self, fw: ResearchFramework) -> str:
@@ -4957,6 +5021,29 @@ class FusionResearchBot:
         quality_report = self._quality_scorer()
         if quality_report.get("status") != "disabled":
             self._last_quality_report = quality_report
+
+        # 确定性质量门禁：无来源/推断/被质疑/过时
+        if getattr(self, "_quality_gate", None):
+            try:
+                gate = self._quality_gate.run_gate()
+                self._last_gate_result = gate
+                if self.event_log:
+                    self.event_log.log(
+                        "quality_gate", "quality", details=gate.summary,
+                        meta={
+                            "passed": gate.passed,
+                            "unsupported": len(gate.unsupported_claims),
+                            "disputed": len(gate.disputed_claims),
+                            "stale": len(gate.stale_claims),
+                        },
+                    )
+                logger.info(f"[质量门禁] {gate.summary}")
+                if not gate.passed:
+                    self._insert_quality_gate_notice(gate)
+                if self._state_store:
+                    self._state_store.record_deliverable("质量门禁", gate.passed, gate.summary)
+            except Exception as e:
+                logger.warning(f"[质量门禁] 执行失败: {e}")
 
     def _step_output_to_gui(self):
         """步骤16: 输出到 GUI"""
