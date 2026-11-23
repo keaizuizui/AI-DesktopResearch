@@ -199,6 +199,25 @@ notepad 调研工具\research_config.json
 }
 ```
 
+常用字段：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `llm_api_key` | 是 | DeepSeek Key；GUI 保存后写入 `research_config.json` |
+| `llm_base_url` | 是 | 默认 DeepSeek；兼容 OpenAI 协议的服务可替换 |
+| `plan_model` / `write_model` | 是 | 规划与写作模型；默认 `deepseek-v4-flash`，可换成账号可用模型 |
+| `search_api_key` | 否 | DeepSeek 搜索 Key；留空时复用 `llm_api_key` |
+| `search_api_endpoint` | 否 | 默认 `https://api.deepseek.com/v1/tools/search` |
+| `output_dir` | 否 | 报告、图表、Excel 输出目录，默认 `output` |
+| `gptr_auto_start` | 否 | 默认 `true`；本机 GPTR 服务未启动时自动拉起 |
+| `gptr_service_url` | 否 | 默认 `http://127.0.0.1:8000/api/v1` |
+| `gptr_service_path` | 否 | GPTR 服务目录；留空时使用仓库内 `gptr_service/` |
+| `ollama_host` / `ollama_model` | 否 | 本地 embedding；不装 Ollama 会自动回退 BM25 |
+
+GUI 的【配置】页与这些字段一一对应。保存后，配置会同步到环境变量，供 GPTR 服务读取。
+
+GPTR 服务无需单独填 Key：调研工具提交任务时会把 `llm_api_key` 透传给服务。只有手动启动 `gptr_service` 并绕过 GUI 直接调用 API 时，才需要复制 `gptr_service/.env.example` 为 `.env` 并填写。
+
 `research_config.json` 已被 `.gitignore` 忽略，不会进入仓库。不要提交真实 Key。
 
 ### 4. 运行
