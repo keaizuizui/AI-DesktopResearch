@@ -2,11 +2,9 @@ import aiofiles
 import asyncio
 import importlib
 import json
-import subprocess
-import sys
 import traceback
 from typing import Any
-from colorama import Fore, Style, init
+from colorama import Fore, Style
 import os
 from enum import Enum
 
@@ -305,21 +303,14 @@ class GenericLLMProvider:
 
 
 def _check_pkg(pkg: str) -> None:
+    """检查依赖是否安装；缺依赖直接报错，不自动安装。
+
+    注意：上游版本会自动执行 pip install。本项目已移除该行为，
+    避免运行时静默安装依赖带来的供应链风险。
+    """
     if not importlib.util.find_spec(pkg):
         pkg_kebab = pkg.replace("_", "-")
-        # Import colorama and initialize it
-        init(autoreset=True)
-
-        try:
-            print(f"{Fore.YELLOW}Installing {pkg_kebab}...{Style.RESET_ALL}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", pkg_kebab])
-            print(f"{Fore.GREEN}Successfully installed {pkg_kebab}{Style.RESET_ALL}")
-
-            # Try importing again after install
-            importlib.import_module(pkg)
-
-        except subprocess.CalledProcessError:
-            raise ImportError(
-                Fore.RED + f"Failed to install {pkg_kebab}. Please install manually with "
-                f"`pip install -U {pkg_kebab}`"
-            )
+        raise ImportError(
+            f"Unable to import {pkg_kebab}. Please install manually with "
+            f"`pip install -U {pkg_kebab}`"
+        )

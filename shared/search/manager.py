@@ -190,7 +190,12 @@ class SearchManager:
                 continue
 
             try:
-                results = adapter.search(query, max_results=max_results)
+                results = adapter.search(query, max_results=max_results) or []
+                # 适配器可能直接返回 dict（如微服务 JSON），统一转成 SearchResult
+                results = [
+                    SearchResult.from_dict(r) if isinstance(r, dict) else r
+                    for r in results
+                ]
                 all_results.extend(results)
                 logger.debug(f"[SearchManager] {source_name}: 返回{len(results)}条结果")
             except Exception as e:

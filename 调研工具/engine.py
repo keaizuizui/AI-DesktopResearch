@@ -46,6 +46,7 @@ from task_state import TaskStateStore, StageFailed, stage_label
 
 # 搜索路线调度
 from shared.billing import RouteDispatcher
+from shared.search.models import CLAIM_SELF_PUBLISHED
 
 # ============================================================
 # 全局上下文管理
@@ -218,7 +219,7 @@ class FusionResearchBot:
 
         self.memory = HybridMemoryStore(
             cfg.get("ollama_host", "http://localhost:11434"),
-            cfg.get("ollama_model", "bge-m3:latest"),
+            cfg.get("ollama_model", "EntropyYue/jina-embeddings-v2-base-zh:latest"),
             llm=self.llm,
             cfg=cfg,
         )
@@ -228,9 +229,11 @@ class FusionResearchBot:
 
         self.raw_task: str = ""
         self.refined_task: str = ""
+        self.topic_keywords: List[str] = []  # 任务主题词，用于素材相关性过滤
         self.plan_text: str = ""
         self.inferable_context: str = ""  # 推演引擎可推理项，注入plan/search
         self.perspective_constraint: str = ""  # 推演引擎主导视角约束，注入plan
+        self.clarify_context: str = ""  # 澄清阶段用户回答，注入plan/search避免跑偏
         self.plan_directions: List[str] = []
         self.plan_core_questions: List[str] = []
         self.plan_coverage: Dict = {}  # Plan方向覆盖度评估结果
@@ -250,7 +253,7 @@ class FusionResearchBot:
         # 素材分层注入 — 聚类器 + 综合器
         self._clusterer = MaterialClusterer(
             ollama_host=cfg.get("ollama_host", "http://localhost:11434"),
-            ollama_model=cfg.get("ollama_model", "bge-m3:latest"),
+            ollama_model=cfg.get("ollama_model", "EntropyYue/jina-embeddings-v2-base-zh:latest"),
         )
         self._synthesizer = MaterialSynthesizer(llm=self.llm)
         self._cluster_reports: List[SynthesisReport] = []  # 缓存的聚类综合报告
@@ -506,7 +509,8 @@ class FusionResearchBot:
         if q_count >= 3:
             try:
                 def _llm_call(prompt_text):
-                    return self._agent_call("planner", [{"role": "user", "content": prompt_text}], max_tokens=3000)
+                    # 推演结果是结构化 JSON，3000 token 会截断导致解析失败
+                    return self._agent_call("planner", [{"role": "user", "content": prompt_text}], max_tokens=6000)
                 engine = DeductionEngine(_llm_call)
                 deduction_result = engine.filter_questions(
                     task=task,
@@ -716,7 +720,7 @@ class FusionResearchBot:
             label = type_labels.get(entity_type, '实体')
             hint = f"""【预获取{label}清单】（已通过搜索获取{len(entities)}个候选{label}，请据此规划搜索批次）：
 {', '.join(entities)}
-请将这些{label}按梯队/规模/模式分组，分配到各搜索批次中。每批查询格式："{label}名 调研维度"（如"某品牌 产品线 2025"）"""
+请将这些{label}按梯队/规模/模式分组，分配到各搜索批次中。每批查询格式："{label}名 调研维度"（如"某品牌 产品线 {datetime.now().year}"）"""
             return hint
 
         except Exception as ex:
@@ -732,7 +736,22 @@ class FusionResearchBot:
             logger.info(f"[阶段1] 已注入推演可推理项（{len(self.inferable_context)}字符）")
             self.inferable_context = ""
 
-        task_summary = task[:2000] if len(task) > 2000 else task
+        # 注入澄清阶段回答，确保业态/角色/范围约束进入计划与搜索词
+        if self.clarify_context and self.clarify_context[:80] not in task:
+            task = task + "\n\n【澄清阶段确认的方向】\n" + self.clarify_context
+            logger.info(f"[阶段1] 已注入澄清回答（{len(self.clarify_context)}字符）")
+
+        task_summary = self._compose_task_summary(task, 2000)
+        biz_terms = self._business_form_keywords()
+        biz_hint = ""
+        if biz_terms:
+            biz_hint = (
+                "【业态关键词——必须体现在搜索查询中】\n"
+                f"调研对象的具体业态：{'、'.join(biz_terms)}。\n"
+                "每批至少2条查询必须把行业名与业态词组合（如“行业名 门店加盟/单店模型/坪效/SKU/选址/供应链”），"
+                "严禁只用行业名词或公司名单独成词。\n"
+            )
+            logger.info(f"[计划生成] 注入业态关键词: {biz_terms}")
         max_pages = int(self.cfg.get("max_pages", 15))
 
         # 根据用户选择的批次数调整prompt
@@ -788,8 +807,9 @@ class FusionResearchBot:
 【搜索模式】{batches_hint}批 × {self.cfg.get("max_iterations",2)}迭代
 {entity_list_hint}
 {self.perspective_constraint}
+{biz_hint}
 
-【能力边界声明】本系统仅支持互联网公开信息的桌面研究，无法执行线下访谈、实地暗访、电话调研、问卷发放。搜索策略和风险提醒中严禁提及上述活动。
+【能力边界声明】本系统仅支持互联网公开信息的桌面研究，无法执行线下访谈、实地暗访、电话调研、问卷发放。搜索策略中严禁提及上述活动。
 
 【需求摘要】{task_summary}
 
@@ -797,7 +817,6 @@ class FusionResearchBot:
 ### 【需求理解】（3-4句话，内容充实不空泛）
 ### 【建议调研方向】（3-5个方向，每个方向说明调研价值）
 {batch_template}
-### 【风险提醒】（仅限桌面研究相关风险：信息遮蔽、时效性偏差、数据口径不一致）
 ### 【核心追问】（1-2个贯穿全文的核心问题，用于后续素材评估）
 ### 【上下文规划】
   - 信息需求清单：明确各章节需要的数据类型（市场规模/竞争格局/案例/趋势）
@@ -808,7 +827,8 @@ class FusionResearchBot:
 1. 每部分至少3-4句话，严禁敷衍
 2. 【搜索批次规划】中每批必须包含3-5个具体搜索查询
 3. 严禁输出"第一章X页、第二章X页"的固定章节结构
-4. 所有规划必须可通过公开搜索执行"""
+4. 所有规划必须可通过公开搜索执行
+5. 查询词必须承接【需求摘要】中的调研对象角色、区域范围与业态，不得退化为行业名词的泛搜"""
 
         if self._user_strategy:
             prompt += f"\n\n【用户确认过的调研策略】\n{self._user_strategy}\n"
@@ -875,13 +895,19 @@ class FusionResearchBot:
                 batches.append({"queries": queries[:8], "max_results": int(self.cfg.get("max_search_results", 5)), "description": lines[0][:40] if lines else ""})
 
         if not batches:
-            keywords = " ".join(re.findall(r'[\u4e00-\u9fa5]{2,6}|[a-zA-Z]{2,20}', self.refined_task)[:8])
+            # 计划书没有【批次】格式时用主题词兜底，避免把任务原文切成碎片当查询
+            anchors = self.topic_keywords or self._task_anchors(self.refined_task)
+            keywords = " ".join((anchors or [])[:4]) or self.refined_task[:20]
+            biz = " ".join(self._business_form_keywords(2))
+            biz = f" {biz}" if biz else ""
+            year = datetime.now().year
             batches = [
-                {"queries": [f"{keywords} 市场规模 {datetime.now().year}", f"{keywords} 行业趋势"], "max_results": int(self.cfg.get("max_search_results", 5)), "description": "宏观层"},
-                {"queries": [f"{keywords} 竞争格局 头部品牌", f"{keywords} 市场份额"], "max_results": int(self.cfg.get("max_search_results", 5)), "description": "中观层"},
-                {"queries": [f"{keywords} 案例 运营模式", f"{keywords} 转化链路"], "max_results": int(self.cfg.get("max_search_results", 5)), "description": "微观层"},
+                {"queries": [f"{keywords}{biz} 市场规模 {year}", f"{keywords}{biz} 行业趋势"], "max_results": int(self.cfg.get("max_search_results", 5)), "description": "宏观层"},
+                {"queries": [f"{keywords}{biz} 竞争格局 头部品牌", f"{keywords}{biz} 市场份额"], "max_results": int(self.cfg.get("max_search_results", 5)), "description": "中观层"},
+                {"queries": [f"{keywords}{biz} 案例 运营模式", f"{keywords}{biz} 转化链路"], "max_results": int(self.cfg.get("max_search_results", 5)), "description": "微观层"},
             ]
-        return batches
+            logger.warning(f"[搜索批次] 计划书未解析出批次，用主题词兜底查询: {keywords[:40]}")
+        return self._inject_business_terms_into_batches(batches)
 
     def _preflight_search_queries(self):
         """evaluator轻量协作——审视搜索查询词的可执行性，标注泛化和盲区。"""
@@ -982,6 +1008,7 @@ class FusionResearchBot:
                 title=m.get("title", ""), url=m.get("url", ""),
                 content=m.get("content", "")[:_gptr_content_length(m)], source="gptr",
                 source_type=m.get("source_type", "report"),
+                claim_nature=m.get("claim_nature", ""),
             ) for m in materials]
             # 用 add_fast 避免LLM压缩阻塞
             # 域名分级处理
@@ -1007,20 +1034,24 @@ class FusionResearchBot:
                 logger.info(f"[GPTR域名分级] 过滤 {blocked_count} 条来自文档分享平台的低质量素材")
             results = filtered_results
 
+            # 只保留与主题相关的 GPTR 素材；企业自述素材在抽取阶段已判定相关性
+            relevant = [
+                r for r in results
+                if self._material_relevant(r, self.refined_task)
+            ]
+            if len(relevant) < len(results):
+                logger.info(f"[GPTR过滤] 丢弃 {len(results) - len(relevant)} 条与主题无关素材")
+            results = relevant
+            if not results:
+                logger.warning("[GPTR素材] 报告未产出与主题相关的素材（抓取页面可能为广告或无关内容）")
+
             self.all_materials.extend(results)
             self.memory.add_fast(results)
             for r in results[:10]:
                 self.state.add_confirmed(r)
 
-            # GPTR结果写入共享搜索缓存，供后续批次搜索/洞察/方案复用
-            if results and hasattr(self.searcher, 'cache') and self.searcher.cache:
-                gptr_cache_data = [r.to_dict() for r in results]
-                # 用refined_task作为缓存key，后续相似query可命中
-                self.searcher.cache.set(self.refined_task, gptr_cache_data)
-                # 同时用plan_directions中的每个方向作为缓存key
-                for d in (self.plan_directions or [])[:5]:
-                    self.searcher.cache.set(d, gptr_cache_data)
-                logger.info(f"[GPTR缓存] 已写入共享缓存: refined_task + {min(len(self.plan_directions or []), 5)}个方向")
+            # 注意：不要把 GPTR 结果写入搜索缓存。否则批次搜索的具体查询可能命中
+            # 这批“任务级”缓存，导致 4 次迭代都返回同一批结果、拿不到新素材。
 
             # GPTR结果写入 Meilisearch 本地搜索索引（跨工具复用）
             try:
@@ -1035,6 +1066,7 @@ class FusionResearchBot:
         if self.search_batches:
             # 批次搜索预算管控：每批消耗1个budget
             batch_count = len(self.search_batches)
+            batch_results = []
             if not self.state.consume_budget(batch_count):
                 logger.warning(f"[批次搜索] 预算不足(需{batch_count}，剩{self.state.search_budget})，跳过批次搜索")
             else:
@@ -1080,19 +1112,24 @@ class FusionResearchBot:
             except Exception as e:
                 logger.warning(f"信源截取回调失败: {e}")
 
-        if self.cfg.get("enable_storm_debate", False) and self.state.search_budget > 0:
+        if self.cfg.get("enable_storm_debate", False):
             logger.info("[STORM辩论] 生成多角度查询...")
             storm_queries = self.searcher.storm_debate_queries(self.refined_task)
-            if storm_queries:
-                cost = min(len(storm_queries), self.state.search_budget)
-                if self.state.consume_budget(cost):
-                    storm_results = self.searcher.multi_search(storm_queries[:cost], max_results=2, workers=4, aggressive=True)
-                    if storm_results:
-                        logger.info(f"[STORM辩论] 补充 {len(storm_results)} 条素材（消耗{cost}预算，剩{self.state.search_budget}）")
-                        self.all_materials.extend(storm_results)
-                        self.memory.add_fast(storm_results)
+            qs = [q for q in (storm_queries or []) if q][: min(8, max(0, self.state.search_budget))]
+            if not qs:
+                logger.warning("[STORM辩论] 搜索预算不足，跳过")
+            else:
+                storm_results = self.searcher.multi_search(qs, max_results=2, workers=4, aggressive=True)
+                if storm_results:
+                    self._charge_search(qs)
+                    logger.info(
+                        f"[STORM辩论] 执行{len(qs)}条查询，补充{len(storm_results)}条素材"
+                        f"（预算剩{self.state.search_budget}）"
+                    )
+                    self.all_materials.extend(storm_results)
+                    self.memory.add_fast(storm_results)
                 else:
-                    logger.warning("[STORM辩论] 预算不足，跳过")
+                    logger.warning(f"[STORM辩论] 执行{len(qs)}条查询，无结果")
 
         # 跨源URL去重
         self._deduplicate_materials()
@@ -1121,6 +1158,19 @@ class FusionResearchBot:
             except Exception as e:
                 logger.warning(f"[DeepScraper] 深挖失败（非致命）: {e}")
 
+        # 素材准入：挡住与主题完全无关的跨行业结果（无关公告、HTML 碎片等）
+        before_count = len(self.all_materials)
+        relevant = [
+            m for m in self.all_materials
+            if self._material_relevant(m, self.refined_task)
+        ]
+        if 3 <= len(relevant) < before_count:
+            logger.info(f"[素材准入] 过滤无关素材 {before_count - len(relevant)} 条，剩余 {len(relevant)} 条")
+            self.all_materials = relevant
+        elif len(relevant) < 3:
+            logger.warning(
+                f"[素材准入] 仅 {len(relevant)} 条命中主题词，保留原素材池（{before_count} 条）以避免空洞"
+            )
         logger.info(f"[L1汇总] 去重后共{len(self.all_materials)}条素材")
 
         # 将搜索结果注册到声明账本
@@ -1275,12 +1325,37 @@ class FusionResearchBot:
         self.plan_coverage = coverage
         return coverage
 
+    def _search_within_budget(self, queries, max_results=3, workers=3, limit=5):
+        """按剩余预算和单次上限截断查询；返回 (结果, 实际执行的查询列表)。"""
+        candidates = [q for q in queries if q]
+        qs = candidates[: min(max(0, limit), max(0, self.state.search_budget))]
+        if not qs:
+            logger.warning("[搜索] 预算已耗尽或查询为空，跳过本轮查询")
+            return [], []
+        results = self.searcher.multi_search(qs, max_results=max_results, workers=workers)
+        logger.info(f"[搜索] 执行{len(qs)}条查询，命中{len(results or [])}条")
+        return results or [], qs
+
+    def _charge_search(self, executed_queries) -> int:
+        """按实际执行的查询数扣预算；只在调用方确认命中后调用。"""
+        cost = min(len(executed_queries or []), self.state.search_budget)
+        if cost and self.state.consume_budget(cost):
+            return cost
+        return 0
+
     def auto_supplement_for_gaps(self, coverage: Dict):
         """对覆盖度评估中标记为'空缺'的方向，自动生成补搜查询并执行。
-        空缺方向较多时启用 search_density 多维度深挖。"""
+
+        与批次搜索、写章补搜共用同一个 search_budget，命中后才按实际
+        执行的查询数扣费。
+        """
         # 受用户设置的自动补搜开关控制
         if not self.cfg.get("auto_supplement", False):
             logger.info("[自动补搜] 未启用，跳过")
+            return
+
+        if self.state.search_budget <= 0:
+            logger.warning("[自动补搜] 搜索预算已耗尽，跳过")
             return
 
         gap_queries = []
@@ -1294,40 +1369,37 @@ class FusionResearchBot:
             logger.info("[自动补搜] 所有方向覆盖充足，无需补充搜索")
             return
 
-        if self.state.search_budget <= 0:
-            logger.warning("[自动补搜] 搜索预算已耗尽，跳过")
-            return
-
         # 空缺方向>=3时，启用 search_density 多维度深挖
         if len(gap_items) >= 3:
-            # search_density 也消耗预算
             density_budget = min(3, self.state.search_budget)
-            if density_budget <= 0:
-                logger.warning("[自动补搜] 预算不足，跳过搜索密度深挖")
-                return
-            if not self.state.consume_budget(density_budget):
-                logger.warning("[自动补搜] 预算不足，跳过搜索密度深挖")
-                return
-            logger.info(f"[自动补搜] 发现{len(gap_items)}个空缺方向，启用搜索密度深挖(消耗{density_budget}预算)...")
-            density_results = self.searcher.search_density(gap_items, top_k=int(self.cfg.get("search_density_top_k", 10)))
+            logger.info(
+                f"[自动补搜] 发现{len(gap_items)}个空缺方向，启用搜索密度深挖"
+                f"(预算{density_budget}条)..."
+            )
+            density_results = self.searcher.search_density(
+                gap_items, top_k=int(self.cfg.get("search_density_top_k", 10)))
             if density_results:
+                self.state.consume_budget(density_budget)
                 self.all_materials.extend(density_results)
                 self.memory.add_fast(density_results)
-                logger.info(f"[搜索密度深挖] 补充{len(density_results)}条素材")
+                logger.info(
+                    f"[搜索密度深挖] 补充{len(density_results)}条素材，预算剩余{self.state.search_budget}")
                 # 深挖后重新匹配章节素材
                 self._auto_assign_chapter_materials()
                 return
 
-        logger.info(f"[自动补搜] 发现{len(gap_queries)}个空缺方向，执行补充搜索...")
-        cost = min(len(gap_queries[:5]), self.state.search_budget)
-        if cost <= 0 or not self.state.consume_budget(cost):
-            logger.warning("[自动补搜] 预算不足，跳过补充搜索")
-            return
-        supplement_results = self.searcher.multi_search(gap_queries[:5], max_results=3, workers=3)
+        supplement_results, executed_queries = self._search_within_budget(
+            gap_queries, max_results=3, workers=3, limit=5)
+        supplement_results = [
+            m for m in (supplement_results or [])
+            if self._material_relevant(m, self.refined_task)
+        ]
         if supplement_results:
+            self._charge_search(executed_queries)
             self.all_materials.extend(supplement_results)
             self.memory.add_fast(supplement_results)
-            logger.info(f"[自动补搜] 补充{len(supplement_results)}条素材，消耗{cost}预算，剩余{self.state.search_budget}")
+            logger.info(
+                f"[自动补搜] 补充{len(supplement_results)}条素材，预算剩余{self.state.search_budget}")
             # 补搜后立即重新匹配章节素材
             self._auto_assign_chapter_materials()
         else:
@@ -1491,6 +1563,11 @@ class FusionResearchBot:
                     {"title": "结论与行动建议", "pages": 2, "thesis": "...", "cases": 0, "tables": 0, "material_idxs": [13, 14, 15]},
                 ]
 
+        # 计划书里的“执行附录/搜索批次”属于执行信息，不是报告正文
+        outline_data = [
+            ch for ch in outline_data
+            if not re.search(r"执行附录|执行附件|搜索批次|检索计划|^\s*附", str(ch.get("title", "")))
+        ] or outline_data
         outline_data = self._enforce_page_budget(outline_data, max_pages)
         total_pages = sum(ch.get("pages", 1) for ch in outline_data)
 
@@ -1547,6 +1624,7 @@ class FusionResearchBot:
 5. 【内部标记禁令】正文中严禁出现：预算、约X页、[待填充]、[CITATION_NEEDED]、本章说明、本章论证、原始报告、素材
 6. 【元叙述禁令】概述用>引用块写2-3句核心论点，禁止写"本章旨在..."等自指句子
 7. 【字数上限】全文严格不超过{skeleton_words}字
+8. 【禁止附录章】不得输出以「附：」开头的章节，不得把检索计划、搜索批次、使用说明写成独立章；用户需求未提风险时，不得新增风险提醒或风险章节
 {chart_hint}
 
 【原始需求】{task}"""
@@ -1775,7 +1853,7 @@ class FusionResearchBot:
             "    加图表：第3章图表 市场份额饼图",
             "    删章节：删除第4章",
             "    调顺序：第2章和第3章交换",
-            "    补素材：第2章补搜 竞争格局 2026",
+            "    补素材：第2章补搜 竞争格局，市场份额（多个关键词用逗号分隔）",
             "=" * 62,
             "",
         ]
@@ -1884,6 +1962,379 @@ class FusionResearchBot:
         markers = ("未收到本章正文", "请提供后润色", "未收到报告", "无法提取核心发现", "本章无素材")
         return any(m in t for m in markers)
 
+    @staticmethod
+    def _chapter_char_count(text: str) -> int:
+        """章节正文字数（剔除标题行和空白），用于页数达成校验。"""
+        body = re.sub(r"^#{1,6}[^\n]*$", "", text or "", flags=re.MULTILINE)
+        return len(re.sub(r"\s+", "", body))
+
+    @staticmethod
+    def _is_valid_search_query(q: str, min_len: int = 4) -> bool:
+        """审稿意见/错误提示不是搜索词，避免把元叙述拿去联网检索。"""
+        if not isinstance(q, str):
+            return False
+        q = q.strip()
+        if not (min_len <= len(q) <= 60):
+            return False
+        noise = (
+            "章节", "正文", "标题", "无法", "缺失", "未提供", "未收到", "请补充",
+            "审查", "无内容", "不存在", "论证链条", "事实陈述", "素材", "#",
+        )
+        return not any(w in q for w in noise)
+
+    # 通用商业词：几乎任何行业报告都会出现，不能作为相关性证据
+    _GENERIC_WORDS = (
+        "用户补充信息", "调研", "研究", "报告", "分析", "中国", "市场规模", "规模",
+        "竞争格局", "格局", "行业", "市场", "份额", "趋势", "发展", "增长",
+        "品牌", "企业", "数据", "亿元", "用户", "补充", "信息", "终端", "零售额",
+        "销量", "营收", "利润", "增速", "均价", "单价", "毛利", "净利", "销售额", "渗透率",
+        "包含", "形成", "一份", "可执行",
+    )
+
+    # 仅保留真正的尾部助词；连词/虚词已由正则切断，不能再剪“和/中/上”等品牌首字
+    _FUNCTION_CHARS = "的了"
+    # 2 字兜底时要排除的泛词
+    _TWO_CHAR_STOP = {
+        "深度", "相关", "进行", "可以", "以及", "通过", "目前", "今年", "去年",
+        "头部", "主要", "重点", "情况", "问题", "方案", "策略", "模式", "结构",
+        "价格", "产品", "服务", "客户", "渠道", "区域", "城市", "国内", "海外",
+        "全球", "我国", "企业", "品牌",
+    }
+
+    # 业态关键词：搜索词只写行业名词（如“脑科学”）会命中无关标的，必须落到具体业态
+    _BUSINESS_TERMS = (
+        "门店加盟", "加盟费", "加盟", "直营", "连锁", "单店模型", "单店",
+        "坪效", "店效", "SKU", "选址", "供应链", "经销商", "渠道",
+        "零售", "检测服务", "客单价", "复购", "总部", "分层",
+    )
+    _CLARIFY_MARKERS = ("【用户补充信息】", "【澄清问题自动回答】")
+
+    def _extract_clarify_context(self, text: str) -> str:
+        """从澄清后的任务文本里截出用户回答部分，供后续 plan/search 复用。"""
+        text = text or ""
+        positions = [text.find(m) for m in self._CLARIFY_MARKERS if m in text]
+        if not positions:
+            return ""
+        return text[min(positions):].strip()[:1500]
+
+    def _business_form_keywords(self, limit: int = 6) -> list[str]:
+        """从澄清回答/任务里提取业态关键词（不做 LLM 调用，保持确定性）。"""
+        ctx = getattr(self, "clarify_context", "") or getattr(self, "refined_task", "")
+        hits = [t for t in self._BUSINESS_TERMS if t in ctx]
+        # 去掉被更长命中词包含的短词（如命中“单店模型”时不再重复加“单店”）
+        hits = [t for t in hits if not any(t != o and t in o for o in hits)]
+        return hits[:limit]
+
+    def _compose_task_summary(self, task: str, limit: int = 2000) -> str:
+        """截断需求摘要，但保证澄清回答不被截掉。"""
+        task = task or ""
+        if len(task) <= limit:
+            return task
+        ctx = (getattr(self, "clarify_context", "") or "")[:800]
+        if ctx and ctx not in task[:limit]:
+            head = task[: max(0, limit - len(ctx) - 20)].rstrip()
+            return f"{head}\n\n【澄清阶段确认的方向】\n{ctx}"
+        return task[:limit]
+
+    def _inject_business_terms_into_batches(self, batches: List[Dict]) -> List[Dict]:
+        """给缺少业态维度的批次改写一条查询，避免整批只搜行业名词。"""
+        terms = self._business_form_keywords()
+        if not terms or not batches:
+            return batches
+        for b in batches:
+            queries = b.get("queries") or []
+            if not queries or any(any(t in q for t in terms) for q in queries):
+                continue
+            suffix = " ".join(terms[:2])
+            base = queries[0][: max(10, 60 - len(suffix) - 1)]
+            queries[0] = f"{base} {suffix}"
+        return batches
+
+    def _extract_topic_keywords(self, task: str) -> list[str]:
+        """任务开始时提取一次主题词，优先用模型，失败回退规则抽取。"""
+        prompt = f"""从下面的调研任务中提取 3-6 个主题关键词，用中文逗号分隔。
+每个关键词 2-4 个字，不要长词组或整句；只输出关键词，不要解释。
+不要“市场/行业/报告/分析/趋势/规模/份额/数据”这类通用词。
+调研任务：{task[:600]}"""
+        try:
+            raw = self.llm.fast(
+                [{"role": "user", "content": prompt}],
+                max_tokens=120,
+                temperature=0.2,
+            )
+            words = []
+            for part in re.split(r"[，,、;；\n]+", raw or ""):
+                w = part.strip(" 。.：:*-")
+                if not (2 <= len(w) <= 6):
+                    continue
+                if w in self._GENERIC_WORDS or w in self._TWO_CHAR_STOP:
+                    continue
+                words.append(w)
+            words = list(dict.fromkeys(words))[:6]
+            if words:
+                logger.info(f"[主题词] 模型提取: {words}")
+                return words
+            logger.warning(f"[主题词] 模型输出未通过过滤，回退规则抽取: {(raw or '')[:80]!r}")
+        except Exception as e:
+            logger.warning(f"[主题词] 模型提取失败，回退规则抽取: {e}")
+        # 模型偶发返回空/异常时用规则锚点兜底，避免主题词为空导致查询退化成任务碎片
+        return self._task_anchors(task)[:4]
+
+    @classmethod
+    def _task_anchors(cls, reference: str) -> list[str]:
+        """从调研任务里抽取主题锚点：剔除通用词后剩下的中文片段。"""
+        ref = (reference or "")[:800]
+        # 去掉“请撰写一份关于…”这类指令前缀
+        ref = re.sub(
+            r"^(请|麻烦|帮我|帮忙)?\s*(撰写|写|做|生成|输出|完成|开展|进行)?\s*(一份|一个|一下)?\s*(关于)?",
+            "", ref,
+        )
+        for word in cls._GENERIC_WORDS:
+            ref = ref.replace(word, "|")
+        # 常见连词/虚词直接切断；句首的“和/或”保留，避免误伤“和路雪”这类品牌名
+        ref = re.sub(r"(?<=[\u4e00-\u9fa5])[和或](?=[\u4e00-\u9fa5])", "|", ref)
+        ref = re.sub(r"[的在与及对为从是有将把被让给向到于]", "|", ref)
+        segments = []
+        for a in re.split(r"[^\u4e00-\u9fa5]+", ref):
+            a = a.strip(cls._FUNCTION_CHARS)
+            # 超过 8 字的是句子碎片，不是主题词
+            if 2 <= len(a) <= 8:
+                segments.append(a)
+        anchors = [a for a in dict.fromkeys(segments) if len(a) >= 3]
+        # 2 字主题（白酒/芯片/犬粮）不因存在长锚点而被丢弃
+        anchors.extend(
+            a for a in dict.fromkeys(segments)
+            if len(a) == 2 and a not in cls._TWO_CHAR_STOP
+        )
+        # 英文主题单独保留，供英文素材按词边界匹配
+        for a in re.findall(r"[A-Za-z][A-Za-z0-9&+._-]{1,}", ref):
+            if a.lower() not in {"the", "and", "for", "with", "report", "data", "market"}:
+                anchors.append(a)
+        return list(dict.fromkeys(anchors))[:40]
+
+    def _material_matches(self, text: str, reference: str = "", claim_nature: str = "") -> bool:
+        """素材与调研主题的相关性门槛，挡住跨行业误检结果。
+
+        企业自述素材在抽取阶段已由模型判定过相关性，标题常被抽象成
+        “产品线分医用与民用系列”这类不含主题词的表述，这里直接放行，
+        否则会把产品矩阵、渠道结构等核心事实误杀。
+        """
+        if claim_nature == CLAIM_SELF_PUBLISHED:
+            return True
+        # 任务开始时提取的主题词优先；模型不可用时回退规则抽取
+        anchors = getattr(self, "topic_keywords", None) or self._task_anchors(
+            reference or self.refined_task
+        )
+        if not anchors:
+            return True
+        for a in anchors:
+            if re.fullmatch(r"[A-Za-z0-9&+._-]+", a):
+                if re.search(rf"(?<![A-Za-z0-9]){re.escape(a)}(?![A-Za-z0-9])", text, re.IGNORECASE):
+                    return True
+            elif a in text:
+                return True
+            elif len(a) >= 4 and any(a[i:i + 3] in text for i in range(len(a) - 2)):
+                # 长主题词允许命中其 3 字连续子串（“儿童专注力”→“专注力”），
+                # 否则素材只写“专注力”时会被误判为无关
+                return True
+        return False
+
+    def _material_relevant(self, m, reference: str = "") -> bool:
+        """按素材对象判断相关性，统一读取 claim_nature，避免调用点漏传。"""
+        text = f"{getattr(m, 'title', '')} {getattr(m, 'content', '')[:2000]}"
+        return self._material_matches(text, reference, getattr(m, "claim_nature", ""))
+
+    @staticmethod
+    def _material_text(meta: dict) -> str:
+        """取素材正文：content 与 fact_card 中第一个非空白的值。"""
+        for key in ("content", "fact_card"):
+            v = (meta.get(key) or "").strip()
+            if v:
+                return v
+        return ""
+
+    @staticmethod
+    def _material_has_content(m) -> bool:
+        """素材是否有可用正文（content 或 fact_card 非空白）。"""
+        meta = m.get('meta', {}) if isinstance(m, dict) else {}
+        return bool(FusionResearchBot._material_text(meta))
+
+    @staticmethod
+    def _is_self_published(meta: dict) -> bool:
+        """素材是否为企业自述/软文类信源。"""
+        return (meta.get("claim_nature") == CLAIM_SELF_PUBLISHED
+                or meta.get("source_type") == "promo")
+
+    @staticmethod
+    def _claim_prefix(meta: dict) -> str:
+        """企业自述素材打标，提示写作层不得当作行业数据使用。"""
+        return "[企业自述] " if FusionResearchBot._is_self_published(meta) else ""
+
+    @staticmethod
+    def _promo_group(meta: dict) -> str:
+        """软文信源分组键：同域名视为同一品牌。"""
+        url = (meta.get("url") or "").strip()
+        domain = re.sub(r"^https?://", "", url).split("/")[0].lower().replace("www.", "")
+        return domain or (meta.get("title") or "")[:20]
+
+    @staticmethod
+    def _merge_source_hint(meta: dict) -> str:
+        """合并素材提示写作层这是同源多篇，避免被当成多个独立证据。"""
+        n = len(meta.get("merged_sources") or [])
+        return f"（同源合并 {n} 篇）" if n > 1 else ""
+
+    def _merge_promo_sources(self, tm: List[Dict]) -> List[Dict]:
+        """同一品牌的多篇软文合并为一条信源，避免被当成多源佐证。
+
+        只合并企业自述/软文素材，第三方数据与研报不受影响。
+        合并时保留最长一条的元信息，正文按去重后拼接（上限 2500 字），
+        并在 merged_sources 中保留每条事实的原始出处。
+        """
+        groups: Dict[str, List[Dict]] = {}
+        for m in tm:
+            meta = m.get("meta", {})
+            if self._is_self_published(meta):
+                groups.setdefault(self._promo_group(meta), []).append(m)
+
+        multi = {g: items for g, items in groups.items() if len(items) > 1}
+        if not multi:
+            return tm
+
+        merged: Dict[str, Dict] = {}
+        for g, items in multi.items():
+            parts, seen, total = [], set(), 0
+            for it in items:
+                c = self._material_text(it.get("meta", {}))
+                if not c or c[:60] in seen:
+                    continue
+                seen.add(c[:60])
+                if total >= 2500:
+                    break
+                parts.append(c[:2500 - total])
+                total += len(parts[-1])
+            lead = max(items, key=lambda x: len(self._material_text(x.get("meta", {}))))
+            meta = dict(lead.get("meta", {}))
+            meta["content"] = "\n".join(parts) or meta.get("content", "")
+            meta["source_group"] = g
+            meta["merged_count"] = len(items)
+            meta["merged_sources"] = [
+                {"title": it.get("meta", {}).get("title", ""), "url": it.get("meta", {}).get("url", "")}
+                for it in items
+            ]
+            merged[g] = {"score": lead.get("score", 0), "text": meta["content"], "meta": meta}
+
+        result, emitted = [], set()
+        for m in tm:
+            meta = m.get("meta", {})
+            if self._is_self_published(meta):
+                g = self._promo_group(meta)
+                if g in multi:
+                    if g not in emitted:
+                        emitted.add(g)
+                        result.append(merged[g])
+                    continue
+            result.append(m)
+
+        logger.info(
+            f"[软文合并] 同品牌软文 {sum(len(v) for v in multi.values())} 条 → {len(multi)} 个信源"
+        )
+        return result
+
+    def _rewrite_chapter_queries(self, ch: dict, max_queries: int = 3) -> list[str]:
+        """章节补搜无结果时，换用更可搜的关键词组合。
+
+        章节标题常是概念性表述（如“价格带与产品结构”），直接拿去搜索
+        往往召回为空。这里让模型改写成“主题 + 具体指标”的关键词，并提供
+        模板兜底，避免依赖单次 LLM 输出。
+        """
+        title = ch.get("title", "")
+        points = " ".join(ch.get("points", []))
+        anchors = self.topic_keywords or self._task_anchors(self.refined_task)
+        topic = anchors[0] if anchors else self.refined_task[:20]
+        biz_terms = self._business_form_keywords()
+        biz_line = f"业态关键词：{'、'.join(biz_terms)}\n" if biz_terms else ""
+        clarify = getattr(self, "clarify_context", "")
+
+        prompt = f"""为下面的报告章节生成 {max_queries} 条联网搜索关键词，每条不超过 20 字。
+只输出关键词，用换行分隔，不要写句子或解释。
+每条关键词必须包含调研对象的业态/场景词，不能只用行业名词或公司名。
+
+调研主题：{self.refined_task[:600]}
+{clarify[:600]}
+{biz_line}章节标题：{title}
+章节要点：{points}"""
+
+        queries: list[str] = []
+        try:
+            raw = self.llm.chat([{"role": "user", "content": prompt}], max_tokens=300, temperature=0.3)
+            for line in (raw or "").splitlines():
+                q = re.sub(r"^[\s\d.、\-•*#]+", "", line).strip().strip("`\"' ")
+                if any(p in q for p in ("。", "，", "：", "#")):
+                    continue
+                if self._is_valid_search_query(q):
+                    queries.append(q[:40])
+        except Exception as e:
+            logger.warning(f"[EXPAND] 关键词改写失败: {e}")
+
+        # 模板兜底：主题 + 业态词 + 章节核心词 + 指标词
+        title_core = title
+        for word in self._GENERIC_WORDS:
+            title_core = title_core.replace(word, " ")
+        title_core = " ".join(title_core.replace("与", " ").split())
+        biz = " ".join(t for t in biz_terms[:2] if t not in title_core)
+        biz = f" {biz}" if biz else ""
+        year = datetime.now().year
+        templates = [
+            f"{topic}{biz} {title_core} {year}",
+            f"{topic}{biz} {points} {year} 数据",
+            f"{topic}{biz} {title_core} 市场规模 份额 {year}",
+        ]
+        for t in templates:
+            t = " ".join(t.split())[:40]
+            if self._is_valid_search_query(t) and t not in queries:
+                queries.append(t)
+        return list(dict.fromkeys(queries))[:max_queries]
+
+    def _write_ai_knowledge_chapter(self, ch: dict) -> str:
+        """补搜无素材时，用模型自身知识填充章节，并在标题上明确标注。"""
+        title = ch.get("title", "本章")
+        points = " / ".join(ch.get("points", []))
+        prompt = f"""【调研主题】{self.refined_task[:300]}
+【章节标题】{title}
+【素材状态】本章没有可核验的外部素材。
+【任务】仅基于你自己的通用知识撰写本章正文，内容必须围绕调研主题展开。
+
+【强制要求】
+1. 不确定的具体数字不要编造，用“约”“量级”等定性表述
+2. 不要标注引用编号，不要声称有外部来源
+3. 覆盖章节要点：{points}
+4. 输出 400-700 字，结构清晰，不写套话"""
+
+        body = ""
+        for _ in range(2):
+            # 这里不能用 writer 角色（其系统提示要求基于素材与引用），直接走通用 chat
+            raw = self.llm.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=2500,
+                temperature=0.4,
+            )
+            body = self._sanitize_chapter_output(raw)
+            if not self._is_placeholder_chapter(body):
+                break
+        else:
+            # 两轮都是占位内容：返回空串，由调用方记录失败并输出不带【AI训练知识】标记的占位
+            logger.warning("[AI补章] 两轮均未产出有效正文，放弃标注")
+            return ""
+
+        # 去掉模型自带的标题行，统一由系统标注
+        body = re.sub(r"^#{1,4}[^\n]*\n+", "", body.strip()).strip()
+        body = re.sub(rf"^#{{1,4}}\s*{re.escape(title)}\s*$", "", body, flags=re.MULTILINE).strip()
+        return (
+            f"### 【AI训练知识】{title}\n\n"
+            f"> 本章缺少可核验的外部素材，以下内容由 AI 训练知识生成，数据请谨慎引用。\n\n"
+            f"{body}"
+        )
+
     def write_chapters(self, final_draft: str):
         logger.info("[阶段6] 基于精化草稿扩写...")
         chapters = self.outline.get("chapters", [])
@@ -1902,52 +2353,260 @@ class FusionResearchBot:
                 q = f"{ch['title']} {' '.join(ch.get('points', []))}"
                 tm = self.memory.search(q, top_k=10)
 
+            # 只保留有正文的素材；“有条目但内容为空”不能算作有素材
+            tm = [m for m in tm if self._material_has_content(m)]
+            # 同品牌多篇软文合并为一条信源，避免“多篇即多源”的假象
+            tm = self._merge_promo_sources(tm)
+
             # EXPAND素材缺口定向补搜（借鉴AgentCPM-Report）
             # 素材不足时，生成补搜查询→执行搜索→匹配新素材→再扩写
             expand_threshold = self.cfg.get("expand_min_materials", 3)
-            if self.cfg.get("enable_expand_gap_fill", True) and len(tm) < expand_threshold and self.state.has_budget():
-                logger.info(f"[EXPAND] 第{idx+1}章素材不足({len(tm)}<{expand_threshold})，触发定向补搜...")
-                try:
-                    gap_query = f"{ch['title']} {' '.join(ch.get('points', []))} 最新数据 案例"
-                    supplement = self.searcher.multi_search([gap_query], max_results=5, workers=3)
-                    if supplement:
-                        self.all_materials.extend(supplement)
-                        self.memory.add_fast(supplement)
-                        self.state.consume_budget()
-                        tm = self.memory.search(f"{ch['title']} {' '.join(ch.get('points', []))}", top_k=10)
-                        logger.info(f"[EXPAND] 补搜{len(supplement)}条，素材增至{len(tm)}条，预算剩余{self.state.search_budget}")
-                    else:
-                        logger.info(f"[EXPAND] 补搜无结果")
-                except Exception as e:
-                    logger.warning(f"[EXPAND] 补搜失败: {e}")
+            empty_attempts = 0
+            if self.cfg.get("enable_expand_gap_fill", True) and len(tm) < expand_threshold:
+                if not self.state.has_budget():
+                    logger.warning(
+                        f"[EXPAND] 第{idx+1}章素材不足({len(tm)}<{expand_threshold})，"
+                        f"但搜索预算已耗尽，未补搜"
+                    )
+                    if self._state_store and not tm:
+                        self._state_store.optional_failed(
+                            "chapter_materials",
+                            RuntimeError(f"第{idx+1}章「{ch['title']}」素材不足且预算耗尽，未补搜"),
+                        )
+                else:
+                    logger.info(f"[EXPAND] 第{idx+1}章素材不足({len(tm)}<{expand_threshold})，触发定向补搜...")
+                    try:
+                        gap_query = f"{ch['title']} {' '.join(ch.get('points', []))} 最新数据 案例"
+                        supplement = self.searcher.multi_search([gap_query], max_results=5, workers=3)
+                        supplement = [
+                            m for m in (supplement or [])
+                            if self._material_relevant(m, self.refined_task)
+                        ]
+                        if supplement:
+                            self.all_materials.extend(supplement)
+                            self.memory.add_fast(supplement)
+                            self.state.consume_budget()
+                            tm = self.memory.search(f"{ch['title']} {' '.join(ch.get('points', []))}", top_k=10)
+                            tm = [
+                                m for m in tm
+                                if ((m.get('meta', {}).get('content') or m.get('meta', {}).get('fact_card') or '').strip())
+                            ]
+                            logger.info(f"[EXPAND] 补搜{len(supplement)}条，素材增至{len(tm)}条，预算剩余{self.state.search_budget}")
+                        else:
+                            empty_attempts += 1
+                            logger.info(f"[EXPAND] 补搜无结果")
+                    except Exception as e:
+                        empty_attempts += 1
+                        logger.warning(f"[EXPAND] 补搜失败: {e}")
+            elif not self.cfg.get("enable_expand_gap_fill", True) and len(tm) < expand_threshold:
+                logger.warning(f"[EXPAND] 第{idx+1}章素材不足({len(tm)})，但补搜开关已关闭")
 
-            mt = "\n".join([f"[{i+1}] {m['meta'].get('title','')}: {self._sanitize_skeleton(smart_truncate(m['meta'].get('content', m['meta'].get('fact_card','')), 800))}" for i,m in enumerate(tm)])
+            # 首轮补搜仍为空：失败不扣预算，所以换搜索词再试（最多2条）
+            if not tm and self.cfg.get("enable_expand_gap_fill", True) and self.state.has_budget():
+                for alt_query in self._rewrite_chapter_queries(ch)[:2]:
+                    if not self.state.has_budget():
+                        break
+                    if hasattr(self.searcher, "should_skip") and self.searcher.should_skip(alt_query):
+                        logger.info(f"[EXPAND] 替代查询已搜过，跳过: {alt_query}")
+                        continue
+                    logger.info(f"[EXPAND] 原查询无结果，改用替代查询: {alt_query}")
+                    try:
+                        supplement = self.searcher.multi_search([alt_query], max_results=5, workers=3)
+                    except Exception as e:
+                        empty_attempts += 1
+                        logger.warning(f"[EXPAND] 替代查询失败: {e}")
+                        continue
+                    supplement = [
+                        m for m in (supplement or [])
+                        if self._material_relevant(m, self.refined_task)
+                    ]
+                    if not supplement:
+                        empty_attempts += 1
+                        logger.info(f"[EXPAND] 替代查询仍无结果: {alt_query}")
+                        continue
+                    self.all_materials.extend(supplement)
+                    self.memory.add_fast(supplement)
+                    self.state.consume_budget()
+                    tm = self.memory.search(f"{ch['title']} {' '.join(ch.get('points', []))}", top_k=10)
+                    tm = [m for m in tm if self._material_has_content(m)]
+                    logger.info(
+                        f"[EXPAND] 替代查询命中{len(supplement)}条，素材增至{len(tm)}条，"
+                        f"预算剩余{self.state.search_budget}"
+                    )
+                    break
+
+            # 补搜可能带回新的同品牌软文，进入写作前再合并一次
+            tm = self._merge_promo_sources(tm)
+
+            if len(tm) == 0:
+                if self.cfg.get("enable_ai_knowledge_fallback", True):
+                    logger.warning(
+                        f"[写作] 第{idx+1}章补搜{empty_attempts}次无素材，"
+                        f"改用 AI 训练知识填充（标题标注【AI训练知识】）"
+                    )
+                    draft = self._write_ai_knowledge_chapter(ch)
+                    if draft:
+                        self.global_context.update_from_chapter(draft, ch["title"], self.llm)
+                        self._persist_chapter(idx, draft)
+                        return idx, draft
+                    msg = (
+                        f"第{idx+1}章「{ch['title']}」补搜{empty_attempts}次无素材，"
+                        f"AI 知识填充两轮均未产出有效正文。"
+                        f"请在【控制面修改】输入关键词（逗号分隔），然后点击【补搜本章】重试"
+                    )
+                    logger.error(f"[写作] {msg}")
+                    if self._state_store:
+                        self._state_store.optional_failed("chapter_materials", RuntimeError(msg))
+                    return idx, (
+                        f"### {ch['title']}\n\n"
+                        f"> 本章补搜{empty_attempts}次仍无素材，AI 知识填充未产出有效正文。"
+                        f"请在【控制面修改】输入关键词（逗号分隔）后点击【补搜本章】重试。\n"
+                    )
+
+                msg = (
+                    f"第{idx+1}章「{ch['title']}」补搜{empty_attempts}次仍无素材，"
+                    f"且 AI 知识填充已关闭（enable_ai_knowledge_fallback=false）。"
+                    f"请在【控制面修改】输入关键词（用逗号分隔），例如："
+                    f"第{idx+1}章补搜 关键词1，关键词2，然后点击【补搜本章】重试"
+                )
+                logger.error(f"[写作] {msg}")
+                if self._state_store:
+                    self._state_store.optional_failed("chapter_materials", RuntimeError(msg))
+                return idx, (
+                    f"### {ch['title']}\n\n"
+                    f"> 本章补搜{empty_attempts}次仍无素材，AI 知识填充已关闭。"
+                    f"请在【控制面修改】输入关键词（逗号分隔）后点击【补搜本章】重试。\n"
+                )
+
+            mt = "\n".join([
+                f"[{i+1}] {self._claim_prefix(m['meta'])}{m['meta'].get('title','')}"
+                f"{self._merge_source_hint(m['meta'])}: "
+                f"{self._sanitize_skeleton(smart_truncate(self._material_text(m['meta']), 800))}"
+                for i, m in enumerate(tm)
+            ])
 
             # 素材分层注入 — 核心素材完整 + 语义搜索补充
             if self._cluster_reports:
                 mt = self._format_layered_materials(tm, ch, idx, mt)
 
             if len(tm) == 0 and ch.get("pages",2) > 1 and not ("摘要" in ch.get("title","") or "发现" in ch.get("title","")):
+                if self.cfg.get("enable_ai_knowledge_fallback", True):
+                    logger.warning(f"[写作] 第{idx+1}章补搜后无素材，改用 AI 训练知识兜底（标题标注【AI训练知识】）")
+                    draft = self._write_ai_knowledge_chapter(ch)
+                    if draft:
+                        self.global_context.update_from_chapter(draft, ch["title"], self.llm)
+                        self._persist_chapter(idx, draft)
+                        return idx, draft
                 return idx, f"### {ch['title']}\n\n> 本章无素材，扩写跳过。\n"
             sk = self._sanitize_skeleton(self._extract_section_from_draft(final_draft, ch["title"]))
             dr = "\n8. 数据密度：至少5个数字、2个品牌、1个案例，数据需有素材支撑" if len(tm) >= 3 else ""
-            mc = sum(len(m.get('meta',{}).get('content','')) for m in tm)
+            mc = sum(len((m.get('meta', {}).get('content') or m.get('meta', {}).get('fact_card') or '')) for m in tm)
+            target_pages = max(1, int(ch.get("pages", 2) or 2))
+            target_words = target_pages * 600  # 1页≈600字，用于篇幅达成校验
+            writer_tokens = max(4000, min(8000, int(target_words * 2)))
             p = f"""【章节标题】【{ch['title']}】
 【素材】{len(tm)}条/{mc}字  【骨架】{smart_truncate(sk,800)}
+【本章目标】约{target_pages}页，正文不少于{target_words}字（不含标题与空白）
 【素材列表】{mt}
-【铁律】基于素材写，标注编号，表格呈现数据，案例四要素，严禁套话
+【铁律】基于素材写，标注编号，每个小节最多1个表格，案例四要素，严禁套话
+【自述素材】标[企业自述]的素材只用于描述友商在做什么，不得用于论证市场规模、增速或行业趋势；引用其数字须注明“企业自述”
 {dr}"""
-            draft = self._sanitize_chapter_output(self._agent_call("writer", [{"role":"user","content":p}], max_tokens=4000))
+            draft = self._sanitize_chapter_output(self._agent_call("writer", [{"role":"user","content":p}], max_tokens=writer_tokens))
             if self._is_placeholder_chapter(draft):
                 logger.warning(f"[写作] 第{idx+1}章疑似占位/空正文，重试一次")
                 retry_p = p + "\n【重要】直接输出本章正文，禁止回复“未收到”“请提供内容”等占位句。"
-                draft = self._sanitize_chapter_output(self._agent_call("writer", [{"role":"user","content":retry_p}], max_tokens=4000))
+                draft = self._sanitize_chapter_output(self._agent_call("writer", [{"role":"user","content":retry_p}], max_tokens=writer_tokens))
             if self._is_placeholder_chapter(draft):
+                if self.cfg.get("enable_ai_knowledge_fallback", True):
+                    logger.warning(
+                        f"[写作] 第{idx+1}章两轮均为占位，改用 AI 训练知识兜底（标题标注【AI训练知识】）"
+                    )
+                    draft = self._write_ai_knowledge_chapter(ch)
+                    if draft:
+                        self.global_context.update_from_chapter(draft, ch["title"], self.llm)
+                        self._persist_chapter(idx, draft)
+                        return idx, draft
                 raise RuntimeError(f"第{idx+1}章正文生成失败（占位或空正文）：{draft[:80]}")
-            if self.cfg.get("enable_self_check_writing",True):
+            # 返回校验：按 页数×600 字判定篇幅，不足时扩写重试一次
+            if self._chapter_char_count(draft) < target_words:
+                logger.warning(
+                    f"[写作] 第{idx+1}章字数不足（{self._chapter_char_count(draft)}<{target_words}），扩写重试一次"
+                )
+                retry_p = p + (
+                    f"\n【篇幅不足】当前正文约{self._chapter_char_count(draft)}字，"
+                    f"请在不编造数据的前提下扩写到不少于{target_words}字，补充机制拆解、口径说明与分场景对比。"
+                )
+                longer = self._sanitize_chapter_output(
+                    self._agent_call("writer", [{"role":"user","content":retry_p}], max_tokens=writer_tokens)
+                )
+                if not self._is_placeholder_chapter(longer) and self._chapter_char_count(longer) > self._chapter_char_count(draft):
+                    draft = longer
+            # 超限收敛：超过目标 1.15 倍时精简一次，避免素材充足后总页数失控
+            over = self._chapter_char_count(draft)
+            if over > target_words * 1.15:
+                logger.warning(f"[写作] 第{idx+1}章字数超限（{over}>{int(target_words * 1.15)}），精简一次")
+                trim_p = (
+                    f"请把下面这一章从约{over}字压缩到{target_words}字左右。"
+                    "必须保留全部数据、编号引用与案例四要素，只删除重复论述、套话与同义复述，直接输出正文：\n\n"
+                    + draft
+                )
+                trimmed = self._sanitize_chapter_output(
+                    self._agent_call("writer", [{"role": "user", "content": trim_p}], max_tokens=writer_tokens)
+                )
+                if not self._is_placeholder_chapter(trimmed) \
+                        and self._chapter_char_count(trimmed) >= target_words * 0.6:
+                    draft = trimmed
+            # 扩写后仍明显不足：预算允许时定向补搜一次并重写，避免章节空心化
+            if self._chapter_char_count(draft) < target_words * 0.6 \
+                    and self.cfg.get("enable_expand_gap_fill", True) and self.state.has_budget():
+                logger.warning(f"[写作] 第{idx+1}章扩写后仍不足目标60%，尝试定向补搜重写")
+                try:
+                    hits = []
+                    for alt_query in self._rewrite_chapter_queries(ch, max_queries=2):
+                        if not self.state.has_budget():
+                            break
+                        got = self.searcher.multi_search([alt_query], max_results=5, workers=3) or []
+                        got = [
+                            m for m in got
+                            if self._material_relevant(m, self.refined_task)
+                        ]
+                        if got:
+                            self.state.consume_budget()
+                            hits.extend(got)
+                            break
+                    if hits:
+                        self.all_materials.extend(hits)
+                        self.memory.add_fast(hits)
+                        tm_new = self.memory.search(
+                            f"{ch['title']} {' '.join(ch.get('points', []))}", top_k=10
+                        )
+                        tm_new = [m for m in tm_new if self._material_has_content(m)]
+                        tm_new = self._merge_promo_sources(tm_new)
+                        if len(tm_new) > len(tm):
+                            mt_new = "\n".join([
+                                f"[{i+1}] {self._claim_prefix(m['meta'])}{m['meta'].get('title','')}"
+                                f"{self._merge_source_hint(m['meta'])}: "
+                                f"{self._sanitize_skeleton(smart_truncate(self._material_text(m['meta']), 800))}"
+                                for i, m in enumerate(tm_new)
+                            ])
+                            mc_new = sum(
+                                len(self._material_text(m.get('meta', {})))
+                                for m in tm_new
+                            )
+                            p = p.replace(mt, mt_new).replace(f"{len(tm)}条/{mc}字", f"{len(tm_new)}条/{mc_new}字")
+                            longer = self._sanitize_chapter_output(
+                                self._agent_call("writer", [{"role": "user", "content": p}], max_tokens=writer_tokens)
+                            )
+                            if not self._is_placeholder_chapter(longer) and self._chapter_char_count(longer) > self._chapter_char_count(draft):
+                                draft = longer
+                                logger.info(f"[写作] 第{idx+1}章补搜重写后 {self._chapter_char_count(draft)} 字")
+                except Exception as e:
+                    logger.warning(f"[写作] 第{idx+1}章定向补搜失败: {e}")
+            # 所有扩写/重写完成后统一校验，避免未校验的替换稿直接落盘
+            if self.cfg.get("enable_self_check_writing", True):
                 draft = self._factcheck_chapter(draft, ch["title"], idx)
             draft = self._sanitize_chapter_output(self.critic_and_rewrite(draft, ch["title"]))
-            if self.cfg.get("enable_fabrication_check",False):
+            if self.cfg.get("enable_fabrication_check", False):
                 draft = self._fabrication_check(draft, ch["title"])
             self.global_context.update_from_chapter(draft, ch["title"], self.llm)
             self._persist_chapter(idx, draft)
@@ -1987,6 +2646,12 @@ class FusionResearchBot:
         return self._sanitize_output(text)
 
     def chapter_level_denoise(self, chapter_md: str, chapter_title: str) -> str:
+        if self._is_placeholder_chapter(chapter_md):
+            logger.info(f"[TTD-DR去噪] {chapter_title} 正文为空，跳过补搜")
+            return chapter_md
+        if "【AI训练知识】" in (chapter_md or ""):
+            logger.info(f"[TTD-DR去噪] {chapter_title} 为 AI 训练知识章节，跳过补搜与改写")
+            return chapter_md
         logger.info(f"[TTD-DR去噪] {chapter_title}")
 
         prompt = f"""【任务】审查本章，识别缺乏数据支撑的论点并给出补搜建议
@@ -2015,19 +2680,25 @@ class FusionResearchBot:
         if not gaps:
             return chapter_md
 
-        queries = [g["query"] for g in gaps if g.get("query")]
+        queries = [g["query"] for g in gaps if self._is_valid_search_query(g.get("query", ""))]
         if not queries:
             return chapter_md
 
-        cost = min(len(queries[:3]), self.state.search_budget)
-        if cost <= 0 or not self.state.consume_budget(cost):
-            logger.warning(f"[定向补搜] 预算不足(需{cost}，剩{self.state.search_budget})，跳过")
+        new_mats, executed_queries = self._search_within_budget(
+            queries, max_results=3, workers=3)
+        if not executed_queries:
+            logger.warning(f"[定向补搜] 预算不足，跳过（剩余{self.state.search_budget}）")
             return chapter_md
 
-        logger.info(f"[定向补搜] {chapter_title} 缺口{len(queries)}个，消耗{cost}预算")
-        new_mats = self.searcher.multi_search(queries[:3], max_results=3, workers=3)
+        logger.info(f"[定向补搜] {chapter_title} 缺口{len(queries)}个，执行补搜（命中后才扣预算）")
+        new_mats = [
+            m for m in (new_mats or [])
+            if self._material_relevant(m, self.refined_task)
+        ]
 
         if new_mats:
+            cost = self._charge_search(executed_queries)
+            logger.info(f"[定向补搜] 命中{len(new_mats)}条，消耗{cost}预算，剩余{self.state.search_budget}")
             self.all_materials.extend(new_mats)
             self.memory.add_fast(new_mats)
 
@@ -2049,6 +2720,10 @@ class FusionResearchBot:
         return chapter_md
 
     def _factcheck_chapter(self, chapter_text: str, chapter_title: str, chapter_idx: int) -> str:
+        if self._is_placeholder_chapter(chapter_text):
+            return chapter_text
+        if "【AI训练知识】" in (chapter_text or ""):
+            return chapter_text
         check_prompt = f"""【任务】审查章节【{chapter_title}】的质量问题
 
 【审查维度】
@@ -2074,13 +2749,18 @@ class FusionResearchBot:
         if not check.get("need_search", False):
             return chapter_text
 
-        queries = check.get("queries", [])
+        queries = [q for q in check.get("queries", []) if self._is_valid_search_query(q)]
         if not queries:
             return chapter_text
 
         logger.info(f"[自主回溯] {chapter_title} 自检发现缺口，定向补搜：{queries}")
-        extra_mats = self.searcher.multi_search(queries[:3], max_results=2, workers=3)
+        extra_mats, executed_queries = self._search_within_budget(queries, max_results=2, workers=3)
+        extra_mats = [
+            m for m in (extra_mats or [])
+            if self._material_relevant(m, self.refined_task)
+        ]
         if extra_mats:
+            self._charge_search(executed_queries)
             self.memory.add_fast(extra_mats)
             self.all_materials.extend(extra_mats)
             evidence = "\n".join([f"[{m.title}] {m.content[:300]}" for m in extra_mats[:5]])
@@ -2168,6 +2848,7 @@ class FusionResearchBot:
       "type": "fact_error / logic_gap / data_conflict / missing_citation / vague_claim",
       "location": "涉及的具体句子原文",
       "description": "具体问题描述，指出错在哪里",
+      "query": "可选：用于补搜的简短关键词（不超过20字，只写关键词，不要写问题描述）",
       "severity": "high / medium / low"
     }}
   ],
@@ -2210,6 +2891,8 @@ class FusionResearchBot:
         Returns:
             修正后的章节内容（或原文）
         """
+        if "【AI训练知识】" in (chapter_text or ""):
+            return chapter_text
         critic_prompt_fwd = f"""【角色】极其挑剔的资深审稿人
 【任务】对章节进行严格质量审查
 
@@ -2233,6 +2916,7 @@ class FusionResearchBot:
       "type": "fact_error / logic_gap / data_conflict / missing_citation / vague_claim",
       "location": "涉及的具体句子原文",
       "description": "具体问题描述，指出错在哪里",
+      "query": "可选：用于补搜的简短关键词（不超过20字，只写关键词，不要写问题描述）",
       "severity": "high / medium / low"
     }}
   ],
@@ -2267,6 +2951,7 @@ class FusionResearchBot:
       "type": "fact_error / logic_gap / data_conflict / missing_citation / vague_claim",
       "location": "涉及的具体句子原文",
       "description": "具体问题描述，指出错在哪里",
+      "query": "可选：用于补搜的简短关键词（不超过20字，只写关键词，不要写问题描述）",
       "severity": "high / medium / low"
     }}
   ],
@@ -2350,18 +3035,23 @@ class FusionResearchBot:
 
     def _do_rewrite(self, chapter_text: str, chapter_title: str, serious: list) -> str:
         """审稿后重写逻辑（抽取为独立方法，供双向和legacy共用）。"""
-        import re
         import json
         extra_queries = []
         for issue in serious[:3]:
-            desc = issue.get("description", "")
-            q = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]", " ", desc)
-            extra_queries.append(q[:60])
+            # 只接受审稿意见里显式给出的搜索词；描述文本是元叙述，不能直接联网
+            q = issue.get("query") or issue.get("search_query") or ""
+            if self._is_valid_search_query(q):
+                extra_queries.append(q[:60])
 
         extra_mats = []
         if extra_queries:
-            extra_mats = self.searcher.multi_search(extra_queries, max_results=2, workers=3)
+            extra_mats, executed_queries = self._search_within_budget(extra_queries, max_results=2, workers=3)
+            extra_mats = [
+                m for m in (extra_mats or [])
+                if self._material_relevant(m, self.refined_task)
+            ]
             if extra_mats:
+                self._charge_search(executed_queries)
                 self.memory.add_fast(extra_mats)
                 self.all_materials.extend(extra_mats)
 
@@ -2421,17 +3111,18 @@ class FusionResearchBot:
                 meta = m.get("meta", {})
                 m_url = meta.get("url", "")
                 title = meta.get("title", "")
-                content = meta.get("content", meta.get("fact_card", ""))
+                content = self._material_text(meta)
+                hint = self._merge_source_hint(meta)
 
                 if m_url and m_url in core_urls:
                     # 核心素材：完整内容
                     core_parts.append(
-                        f"[C{i+1}] {title}: {self._sanitize_skeleton(smart_truncate(content, 2000))}"
+                        f"[C{i+1}] {self._claim_prefix(meta)}{title}{hint}: {self._sanitize_skeleton(smart_truncate(content, 2000))}"
                     )
                 else:
                     # 其余素材：180 字摘要（ContextCompressor 风格）
                     other_parts.append(
-                        f"[{i+1}] {title}: {self._sanitize_skeleton(smart_truncate(content, 180))}"
+                        f"[{i+1}] {self._claim_prefix(meta)}{title}{hint}: {self._sanitize_skeleton(smart_truncate(content, 180))}"
                     )
 
             # 语义搜索补充：从全量素材中拉取 top 3
@@ -2445,7 +3136,7 @@ class FusionResearchBot:
                         sr_title = sr.get("meta", {}).get("title", "")
                         sr_content = sr.get("meta", {}).get("content", "")
                         semantic_parts.append(
-                            f"[S{si+1}] {sr_title}: {self._sanitize_skeleton(smart_truncate(sr_content, 800))}"
+                            f"[S{si+1}] {self._claim_prefix(sr.get('meta', {}))}{sr_title}: {self._sanitize_skeleton(smart_truncate(sr_content, 800))}"
                         )
 
             # 组装
@@ -2595,7 +3286,13 @@ class FusionResearchBot:
         reviewed = []
         failures = 0
         skipped = 0
+        ai_skipped = 0
         for i, ch in enumerate(chapters):
+            if "【AI训练知识】" in (ch or ""):
+                reviewed.append(ch)
+                ai_skipped += 1
+                logger.info(f"[EditorAgent] 第{i+1}章为 AI 训练知识章节，跳过统稿以保留标注")
+                continue
             if len(ch) > 12000:
                 reviewed.append(ch)
                 skipped += 1
@@ -2629,18 +3326,33 @@ class FusionResearchBot:
         if failures == len(chapters):
             raise RuntimeError("EditorAgent 逐章统稿全部失败")
         logger.info(
-            f"[EditorAgent] 逐章统稿完成：成功{len(chapters)-failures-skipped}章，"
-            f"保留原文{failures}章，过长跳过{skipped}章"
+            f"[EditorAgent] 逐章统稿完成：成功{len(chapters)-failures-skipped-ai_skipped}章，"
+            f"保留原文{failures}章，AI跳过{ai_skipped}章，过长跳过{skipped}章"
         )
         return reviewed
 
     def _extract_section_from_draft(self, draft: str, chapter_title: str) -> str:
-        for pat in [f"## {chapter_title}", f"## {chapter_title.replace('、', ' ')}"]:
-            idx = draft.find(pat)
-            if idx != -1:
-                nxt = draft.find("\n## ", idx + len(pat))
-                return draft[idx:nxt] if nxt != -1 else draft[idx:]
-        return draft[:1200]
+        """从骨架草稿中提取指定章节，兼容 ## / ### 标题与中文序号。"""
+        def _norm(t: str) -> str:
+            return re.sub(r'^[一二三四五六七八九十]+[、.．]\s*', '', (t or "").strip())
+
+        lines = (draft or "").split('\n')
+        target = _norm(chapter_title)
+        start, level = None, 0
+        for i, line in enumerate(lines):
+            m = re.match(r'^(#{1,4})\s+(.+)$', line.strip())
+            if not m:
+                continue
+            title = m.group(2).strip()
+            if start is None:
+                if target and (target in title or _norm(title) == target):
+                    start = i
+                    level = len(m.group(1))
+            elif len(m.group(1)) <= level:
+                return "\n".join(lines[start:i])
+        if start is not None:
+            return "\n".join(lines[start:])
+        return (draft or "")[:1200]
 
     def final_gap_check(self) -> List[str]:
         if not self.final_draft or len(self.final_draft.strip()) < 500:
@@ -2681,15 +3393,20 @@ class FusionResearchBot:
                 if self.state.search_budget <= 0:
                     logger.warning("[缺口补搜] 预算耗尽，停止补搜")
                     break
-                gap_query = gap.get("query", gap.get("description", "")) if isinstance(gap, dict) else gap
-                if not gap_query:
+                gap_query = gap.get("query", "") if isinstance(gap, dict) else str(gap)
+                if not self._is_valid_search_query(gap_query):
                     continue
                 query = gap_query + (modifiers[round_idx] if round_idx < len(modifiers) else "")
-                if not self.state.consume_budget(1):
+                if self.state.search_budget <= 0:
                     break
                 try:
                     results = self.searcher.multi_search([query], max_results=per_gap, workers=2)
+                    results = [
+                        m for m in (results or [])
+                        if self._material_relevant(m, self.refined_task)
+                    ]
                     if results:
+                        self.state.consume_budget(1)
                         self.all_materials.extend(results)
                         logger.info(
                             f"[缺口补搜] 第{round_idx + 1}轮 '{query[:30]}' → 补充 {len(results)} 条"
@@ -2726,22 +3443,37 @@ class FusionResearchBot:
         return self._agent_call("writer", [{"role": "user", "content": prompt}], max_tokens=800)
 
     def supplement_search(self, chapter_idx: int, query: str) -> bool:
-        if not self.state.consume_budget(1):
-            logger.warning("[补搜] 搜索预算已耗尽")
-            return False
+        """手动补搜：支持逗号分隔的多个关键词，逐个尝试直到抓到素材。"""
+        keywords = [k.strip() for k in re.split(r"[，,;；\n]+", query or "") if k.strip()]
 
         # query为空时用章节标题回退
-        if not query or not query.strip():
+        if not keywords:
             chapters = self.outline.get("chapters", [])
-            if 0 <= chapter_idx < len(chapters):
-                query = chapters[chapter_idx].get("title", "")
-            if not query:
-                query = self.report_title
-            logger.info(f"[补搜] 第{chapter_idx+1}章 使用标题回退: {query}")
+            title = chapters[chapter_idx].get("title", "") if 0 <= chapter_idx < len(chapters) else ""
+            keywords = [title or self.report_title]
+            logger.info(f"[补搜] 第{chapter_idx+1}章 使用标题回退: {keywords[0]}")
 
-        logger.info(f"[补搜] 第{chapter_idx+1}章：{query}")
-        results = self.searcher.multi_search([query], max_results=5, workers=3)
-        if results:
+        logger.info(f"[补搜] 第{chapter_idx+1}章 关键词: {keywords}")
+        for keyword in keywords:
+            if not self._is_valid_search_query(keyword, min_len=2):
+                logger.warning(f"[补搜] 关键词无效，跳过: {keyword}")
+                continue
+            if self.state.search_budget <= 0:
+                logger.warning("[补搜] 搜索预算已耗尽")
+                return False
+
+            logger.info(f"[补搜] 第{chapter_idx+1}章 尝试: {keyword}")
+            results = self.searcher.multi_search([keyword], max_results=5, workers=3)
+            results = [
+                m for m in (results or [])
+                if self._material_relevant(m, self.refined_task)
+            ]
+            if not results:
+                logger.info(f"[补搜] 关键词无结果: {keyword}")
+                continue
+
+            # 命中后才扣预算
+            self.state.consume_budget(1)
             self.all_materials.extend(results)
             self.memory.add_fast(results)
             chapters = self.outline.get("chapters", [])
@@ -2752,7 +3484,10 @@ class FusionResearchBot:
                 for i in range(start_idx, len(self.all_materials) + 1):
                     if i not in chapters[chapter_idx]["material_idxs"]:
                         chapters[chapter_idx]["material_idxs"].append(i)
+            logger.info(f"[补搜] 命中{len(results)}条，已归入第{chapter_idx+1}章")
             return True
+
+        logger.warning(f"[补搜] 所有关键词均无结果: {keywords}")
         return False
 
 
@@ -2808,7 +3543,7 @@ class FusionResearchBot:
             threshold = self.cfg.get("loop_similarity_threshold", 0.85)
             store = OllamaVectorStore(
                 self.cfg.get("ollama_host", "http://localhost:11434"),
-                self.cfg.get("ollama_model", "bge-m3:latest"),
+                self.cfg.get("ollama_model", "EntropyYue/jina-embeddings-v2-base-zh:latest"),
             )
             recent = chapter_texts[-3:] if len(chapter_texts) >= 3 else chapter_texts[-2:]
             truncated = [t[:2000] for t in recent]
@@ -3306,6 +4041,122 @@ class FusionResearchBot:
         logger.info(f"[过程质量] 综合: {result['overall']:.2f} (搜前:{result['pre_search']:.2f} 搜中:{result['in_search']:.2f} 搜后:{result['post_search']:.2f})")
         return result
 
+    def _ensure_chapter_integrity(self):
+        """统稿/结构复审后按骨架对齐章节；缺失章节补写，避免静默丢章。"""
+        chapters = self.outline.get("chapters", [])
+        if not chapters or not self.chapters_md:
+            return
+
+        def _key(title: str) -> str:
+            t = re.sub(r'^第[一二三四五六七八九十百\d]+章[\s:：、.]*', '', title or "").strip()
+            t = re.sub(r'^\d+(?:\.\d+)*[.、]?\s*', '', t).strip()
+            return re.sub(r'[\s《》“”"\']', '', t)[:40]
+
+        def _overlap(a: str, b: str) -> float:
+            """按中文二元组重合度判断两个标题是否指向同一章。"""
+            if not a or not b:
+                return 0.0
+            ga = {a[i:i + 2] for i in range(len(a) - 1)}
+            gb = {b[i:i + 2] for i in range(len(b) - 1)}
+            if not ga or not gb:
+                return 1.0 if a == b else 0.0
+            return len(ga & gb) / min(len(ga), len(gb))
+
+        def _title_of(text: str) -> str:
+            # 兼容 ## / ### 两级章节标题
+            m = re.search(r'^#{1,3}\s+(.+)$', text or "", re.MULTILINE)
+            return _key(m.group(1)) if m else ""
+
+        keys = [_key(m.get("title", "")) for m in chapters]
+        cand_keys = [_title_of(c) for c in self.chapters_md]
+
+        def _trim_nested(text: str, own_key: str) -> str:
+            """裁掉章节内嵌的其他章标题（骨架提取越界会带入下一章内容）。"""
+            lines = (text or "").split('\n')
+            for li, line in enumerate(lines):
+                if li == 0:
+                    continue
+                m = re.match(r'^#{1,3}\s+(.+)$', line.strip())
+                if not m:
+                    continue
+                k = _key(m.group(1))
+                if k and k != own_key and any(
+                    k == keys[j] or _overlap(k, keys[j]) >= 0.3 for j in range(len(keys))
+                ):
+                    return "\n".join(lines[:li]).strip()
+            return text
+
+        aligned, missing, used = [], [], set()
+        # 1) 精确匹配优先：先把完全同名的章节锁定，避免近似匹配抢占唯一候选
+        exact_hit = {}
+        for i, key in enumerate(keys):
+            for idx, ck in enumerate(cand_keys):
+                if idx not in used and ck and ck == key:
+                    exact_hit[i] = idx
+                    used.add(idx)
+                    break
+
+        for i, key in enumerate(keys):
+            if i in exact_hit:
+                text = _trim_nested(self.chapters_md[exact_hit[i]], key)
+                aligned.append(text)
+                if self._chapter_char_count(text) < 120:
+                    missing.append(i)
+                continue
+            # 2) 标题高度重叠（近似匹配）
+            hit = None
+            for idx, ck in enumerate(cand_keys):
+                if idx in used or not ck:
+                    continue
+                if _overlap(ck, key) >= 0.3:
+                    hit = idx
+                    break
+            if hit is not None:
+                text = _trim_nested(self.chapters_md[hit], key)
+                aligned.append(text)
+                used.add(hit)
+                if self._chapter_char_count(text) < 120:
+                    missing.append(i)
+                continue
+            # 2) 位置兜底：该位置内容不属于任何其他骨架章时，保留为该章内容
+            text = ""
+            if i < len(self.chapters_md) and i not in used:
+                if not cand_keys[i]:
+                    # 无标题但正文可观，按位置保留，避免被空白占位覆盖
+                    if self._chapter_char_count(self.chapters_md[i]) >= 300:
+                        text = self.chapters_md[i]
+                        used.add(i)
+                else:
+                    belongs_elsewhere = any(
+                        j != i and (cand_keys[i] == keys[j] or _overlap(cand_keys[i], keys[j]) >= 0.3)
+                        for j in range(len(keys)) if j not in used
+                    )
+                    if not belongs_elsewhere:
+                        text = _trim_nested(self.chapters_md[i], key)
+                        used.add(i)
+            if self._chapter_char_count(text) < 120:
+                missing.append(i)
+            aligned.append(text)
+
+        if len(aligned) != len(self.chapters_md):
+            logger.warning(f"[章节校验] 按骨架对齐章节：{len(self.chapters_md)} → {len(aligned)} 章")
+        self.chapters_md = aligned
+
+        for i in missing:
+            title = chapters[i].get("title", f"第{i+1}章")
+            logger.warning(f"[章节校验] 第{i+1}章「{title}」缺失或为空，尝试补写")
+            draft = ""
+            if self.cfg.get("enable_ai_knowledge_fallback", True):
+                draft = self._write_ai_knowledge_chapter(chapters[i])
+            if draft:
+                self.chapters_md[i] = draft
+                self._persist_chapter(i, draft)
+                continue
+            self.chapters_md[i] = (
+                f"### {title}\n\n"
+                f"> 本章生成失败，请在【控制面修改】输入关键词（逗号分隔），然后点击【补搜本章】重试。\n"
+            )
+
     def _structure_review(self):
         """涌现后结构复审——重排章节、添加过渡、检测重复标题。"""
         if len(self.chapters_md) < 3:
@@ -3537,7 +4388,6 @@ class FusionResearchBot:
 ### 【搜索批次规划】（深度模式，生成{batches_hint}-{batches_hint+2}个批次）
    批次1-行业宏观  批次2-第一梯队头部  批次3-第二梯队A组  批次4-第二梯队B组 ... 最后一批-交叉对比矩阵
    每批3-5个查询，必须包含企业名+调研维度
-### 【风险提醒与信息缺口】（区分"已知风险"和"未知缺口"，标注哪些数据公开渠道难获取）
 ### 【核心追问】（3-5个贯穿全文的核心问题，每个说明该问题如何影响报告结论）
 ### 【数据需求矩阵】（表格列出：章节/所需数据类型/优先级/预计来源）
 
@@ -3572,6 +4422,8 @@ class FusionResearchBot:
         await self.depth_search()
         self.check_plan_coverage()
         self.auto_supplement_for_gaps(self.plan_coverage)
+        if getattr(self.state, "search_failure", False) and not self.all_materials:
+            raise RuntimeError("GPTR 搜索失败，自动补搜也未获得可用素材，已终止本次调研")
         ma = self.assess_materials_and_emerge_outline()
         self.zero_draft = self.generate_zero_shot_draft(self.refined_task, ma)
         self.outline = self.parse_outline_from_draft(self.zero_draft, ma)
@@ -3661,7 +4513,7 @@ class FusionResearchBot:
     # ============================================================
 
     def _step_prepare_task(self, task):
-        """步骤1: 任务准备 —— 意图路由 + 输入安全清洗
+        """步骤1: 任务准备 —— 输入安全清洗
 
         Args:
             task: 原始任务字符串
@@ -3669,19 +4521,6 @@ class FusionResearchBot:
         Returns:
             经安全清洗后的任务字符串
         """
-        # 意图路由 — 判断 task 是否模糊
-        try:
-            from shared.intent_router import IntentRouter
-            router = IntentRouter()
-            self._intent_result = router.assess(task)
-            if self._intent_result.fuzzy:
-                logger.info(
-                    f"[IntentRouter] 调研工具输入模糊 | 级别={self._intent_result.fuzzy_level.value} | "
-                    f"深度={self._intent_result.interrogation_depth} | Phase0={self._intent_result.needs_phase0}"
-                )
-        except ImportError:
-            self._intent_result = None
-
         # 输入安全清洗
         try:
             from shared.input_guard import sanitize_content
@@ -3856,6 +4695,7 @@ class FusionResearchBot:
 
         if self.v15_mode and self.framework:
             self.refined_task = task
+            self.topic_keywords = self._extract_topic_keywords(task)
             if self.gui and hasattr(self.gui, "wait_for_framework_confirm"):
                 framework_text = self.framework.to_markdown()
                 action = self.gui.wait_for_framework_confirm(framework_text)
@@ -3884,6 +4724,10 @@ class FusionResearchBot:
         self.refined_task = self.clarify_questions(task)
         if not self.refined_task or not self.refined_task.strip():
             raise RuntimeError("澄清阶段没有返回有效任务描述")
+        self.clarify_context = self._extract_clarify_context(self.refined_task)
+        if self.clarify_context:
+            logger.info(f"[澄清] 已提取用户回答{len(self.clarify_context)}字符，注入后续计划与搜索")
+        self.topic_keywords = self._extract_topic_keywords(self.refined_task)
 
     def _step_setup_search_matrix(self):
         """步骤5: 搜索矩阵配置 —— 从SEARCH_DEPTH_MAP推导搜索参数"""
@@ -3926,16 +4770,21 @@ class FusionResearchBot:
             logger.info(f"[计划确认] 已按修改意见重新生成 {len(self.search_batches)} 个批次")
 
     async def _step_deep_search(self):
-        """步骤8: 深度搜索。"""
+        """步骤8: 深度搜索。无素材不在此处抛错，交给步骤9自动补搜后再判定。"""
         await self.depth_search()
-        if not self.all_materials:
-            raise RuntimeError("深度搜索未获得任何素材")
 
     def _step_gap_detection(self):
-        """步骤9: 覆盖度检查 + 补搜。"""
+        """步骤9: 覆盖度检查 + 补搜。补搜后仍无素材才判定失败。"""
         coverage = self.check_plan_coverage()
         self.plan_coverage = coverage
         self.auto_supplement_for_gaps(coverage)
+        if not self.all_materials:
+            # 搜索与补搜同属可重试范围：恢复任务时 search 阶段应重新执行
+            if getattr(self, "_state_store", None):
+                self._state_store.reset_stage("search")
+            if getattr(self.state, "search_failure", False):
+                raise RuntimeError("GPTR 搜索失败，自动补搜也未获得可用素材，已终止本次调研")
+            raise RuntimeError("深度搜索未获得任何素材，自动补搜也未获得可用素材，已终止本次调研")
 
     def _step_outline_iteration(self):
         """步骤10: 素材评估与大纲生成。"""
@@ -4067,6 +4916,11 @@ class FusionResearchBot:
             self._structure_review()
         except Exception as e:
             logger.warning(f"[结构复审] 跳过: {e}")
+        # 统稿与结构复审都可能丢章，这里按骨架对齐并补写缺失章节
+        try:
+            self._ensure_chapter_integrity()
+        except Exception as e:
+            logger.warning(f"[章节校验] 跳过: {e}")
         try:
             patterns_md = self._synthesize_patterns()
         except Exception as e:

@@ -13,8 +13,6 @@ from enum import Enum
 from v15_3_config import SOURCE_CREDIBILITY
 from base64 import b64encode, b64decode
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from openai import OpenAI
 
@@ -29,19 +27,19 @@ def _get_encryption_key() -> bytes:
         # 使用环境变量提供的密钥
         return key.encode()
     
-    # 如果没有设置，使用机器特定信息生成（每次重启相同）
-    import platform
-    salt = platform.node().encode()  # 机器名作为salt
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=100000,
-    )
-    # 生成32字节密钥，然后转为URL-safe base64编码
-    key_bytes = kdf.derive(b"xiaozui-default-key")
-    from base64 import urlsafe_b64encode
-    return urlsafe_b64encode(key_bytes)
+    # 未配置环境变量时，用本地持久化的随机密钥，避免可预测的默认值
+    path = os.path.join(os.path.expanduser("~"), ".xiaozui_enc_key")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read().strip()
+    key_bytes = Fernet.generate_key()
+    with open(path, "wb") as f:
+        f.write(key_bytes)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return key_bytes
 
 def encrypt_api_key(plain_text: str) -> str:
     """加密API Key，返回base64编码的密文
@@ -68,9 +66,9 @@ def encrypt_api_key(plain_text: str) -> str:
         f = Fernet(key)
         return f.encrypt(plain_text.encode()).decode()
     except Exception as e:
-        # 加密失败时返回原文（降级）
-        logger.warning(f"API Key加密失败: {e}，返回原文")
-        return plain_text
+        # 加密失败时不返回明文，避免用户误以为已加密
+        logger.error(f"API Key加密失败，已放弃保存: {e}")
+        return ""
 
 def decrypt_api_key(cipher_text: str) -> str:
     """解密API Key"""
@@ -89,10 +87,14 @@ def decrypt_api_key(cipher_text: str) -> str:
         return cipher_text
 
 # ---------- 日志 ----------
+# pythonw 启动时 sys.stderr 为 None，直接 basicConfig 会创建 stream=None 的
+# StreamHandler，导致每条日志都抛 "NoneType has no attribute write"。
+_root_handlers = [logging.StreamHandler(sys.stderr)] if sys.stderr is not None else []
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
+    handlers=_root_handlers or [logging.NullHandler()],
 )
 logger = logging.getLogger("xiaozui")
 
@@ -117,11 +119,12 @@ AGENT_PROMPTS = {
 【输出纪律——强制约束】
 1. 严禁AI套话前缀，直接输出正文
 2. 章节标题统一使用###标记
-3. 风险提醒仅写桌面研究可验证的风险（信息遮蔽、时效性、数据口径偏差）
+3. 检索计划与搜索批次只用于执行，不得进入报告章节目录；用户需求未提风险时，不要单独设风险提醒或风险章节
 4. 涉及多实体/企业时必须明确列出并按梯队分组
 5. 严禁提及线下访谈、实地调研、电话访问等本系统无法执行的活动
 【质量要求】每部分内容充实，避免空洞表述，所有规划必须可落地执行。
-【多视角审视——头脑风暴精神】制定调研方向和搜索批次时，请从以下五个视角审视，确保维度不遗漏：①乐观视角（增长机会、利好因素）②悲观视角（风险信号、下行压力）③技术视角（技术壁垒、供应链、产品差异）④市场视角（消费者真实需求、渠道结构、竞争格局）⑤跨界视角（从其他行业类比寻找可迁移的模式或教训）。若某视角能产生独特的搜索维度，纳入规划。""",
+【搜索批次——必须输出】在调研方向之后，用「【批次1】」「【批次2】」「【批次3】」分三层列出可执行查询词，每批 2-4 条；查询词必须是可直接输入搜索引擎的短句（含业态/地域/年份等限定），不要写成整段描述或问句。
+【多视角审视——头脑风暴精神】制定调研方向和搜索批次时，请从以下五个视角审视，确保维度不遗漏：①乐观视角（增长机会、利好因素）②悲观视角（仅当用户需求涉及风险、合规或下行压力时才启用）③技术视角（技术壁垒、供应链、产品差异）④市场视角（消费者真实需求、渠道结构、竞争格局）⑤跨界视角（从其他行业类比寻找可迁移的模式或教训）。若某视角能产生独特的搜索维度，纳入规划。""",
 
     "search": """【角色定位】你是专业的信息检索与质量评估专家。
 【核心职责】基于搜索结果进行事实提取、质量评估、可信度分级。
@@ -409,11 +412,11 @@ DEFAULT_CONFIG = {
     "search_provider": "deepseek",
     "search_depth": "b",  # 保留兼容，优先使用下方独立控件值
     "search_batches": 3,     # 搜索批次数 (1=仅宏观, 2=宏观+中观, 3=宏观+中观+微观)
-    "auto_supplement": False, # 自动补搜开关
+    "auto_supplement": True, # 自动补搜开关（默认开启：搜索后按计划缺口继续补搜）
     "deepseek_cost_per_1k": "0.01",  # DeepSeek每1k token费用(CNY) 约0.01元/千字  # 约0.01元/千字
     "user_domain_blacklist": [],  # 用户自定义域名黑名单
     "ollama_host": "http://localhost:11434",
-    "ollama_model": "bge-m3:latest",
+    "ollama_model": "EntropyYue/jina-embeddings-v2-base-zh:latest",
     "ollama_embed_chunk": 8,
     "ollama_embed_timeout": 120,
     "ollama_query_timeout": 15,
@@ -468,6 +471,9 @@ DEFAULT_CONFIG = {
     "gptr_start_timeout": 20,
     "gptr_task_timeout": 600,
     "gptr_service_path": "",
+    # GPTR 失败/返回空上下文时，是否自动移交 DeepSeek 补搜。
+    # 默认关闭：GPTR 是主搜索源，失败应当显式暴露，而不是静默换源。
+    "gptr_fallback_to_deepseek": False,
     
     # ===== 搜索缓存配置 =====
     "enable_search_cache": True,           # 启用搜索缓存
@@ -508,6 +514,9 @@ DEFAULT_CONFIG = {
     #   核心约束：新内容必须有素材支撑，不增加幻觉风险
     "enable_expand_gap_fill": True,
     "expand_min_materials": 3,                  # 章节素材低于此数触发补搜
+    # 两次补搜仍无素材时，用 AI 训练知识填充章节，标题标注【AI训练知识】
+    # 关闭后：日志报错，可在【控制面修改】输入关键词（逗号分隔）后点【补搜本章】
+    "enable_ai_knowledge_fallback": True,
     
     # 功能5: 质量自动评分（多维报告质量评估）
     #   建议：本地✅ | 常规✅ | 深度✅ — 三档全开，basic模式零LLM成本
@@ -656,7 +665,8 @@ class LLMClient:
             raise RuntimeError("大模型 API Key 未配置")
         m = model or self.cfg.get("write_model", "deepseek-v4-flash")
         temp = temperature if temperature is not None else self.cfg.get("temperature_write", 0.7)
-        msgs = messages.copy()
+        # 复制消息字典，避免改写调用方传入的首条 system 消息
+        msgs = [dict(m) for m in messages]
         if system:
             if msgs and msgs[0].get("role") == "system":
                 msgs[0]["content"] = system

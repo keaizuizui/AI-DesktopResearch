@@ -320,15 +320,31 @@ class QualityGate:
         )
 
     def build_source_appendix(self) -> str:
-        """构建来源追溯表"""
+        """构建来源追溯表（按来源去重，避免逐条声明撑大报告篇幅）"""
         claims = self.ledger.get_all_claims(ClaimStatus.SUPPORTED)
         if not claims:
             return "（无已支持的声明）"
 
-        lines = ["| 字段 | 值 | 来源 | 来源ID | 写入者 |",
-                 "|------|-----|------|--------|--------|"]
+        sources = {}
         for c in sorted(claims, key=lambda x: x.created_at):
-            lines.append(f"| {c.field_name} | {c.value} | {c.source} | {c.source_id} | {c.writer} |")
+            title = (c.value or c.field_name or "").strip()
+            url = (c.source or "").strip()
+            key = c.source_id or url or title
+            if not key or key in sources:
+                continue
+            sources[key] = (title, url)
+
+        def _cell(text: str, limit: int = 0) -> str:
+            """Markdown 表格单元格转义：竖线转义、换行折成空格。"""
+            s = (text or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+            return s[:limit] if limit else s
+
+        lines = ["| 序号 | 来源 | 链接 |",
+                 "|------|------|------|"]
+        for i, (_, (title, url)) in enumerate(list(sources.items())[:12], 1):
+            lines.append(f"| {i} | {_cell(title, 80) or '—'} | {_cell(url) or '—'} |")
+        if len(sources) > 12:
+            lines.append(f"\n共 {len(sources)} 个来源，仅列前 12 个。")
 
         return "\n".join(lines)
 

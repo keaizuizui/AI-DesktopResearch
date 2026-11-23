@@ -9,8 +9,6 @@ import os, re, json, ast, sys
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
-import numpy as np
-
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -20,13 +18,6 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from v16_1_utils import smart_truncate
 from config import logger, LLMClient, extract_json, AGENT_PROMPTS
 from shared.llm_client import safe_json_loads
-
-# TimesFM 预测（可选依赖）
-try:
-    from shared.timesfm_predictor import TimesFMPredictor
-    TIMESFM_AVAILABLE = True
-except ImportError:
-    TIMESFM_AVAILABLE = False
 
 PLOTLY_AVAILABLE = False
 KALEIDO_AVAILABLE = False
@@ -188,6 +179,51 @@ def _sandbox_env(work_dir: str) -> Dict[str, str]:
     return keep
 
 
+_NUM_UNIT = r'(?:个月|%|亿元|万元|万|元|家|人|台|个|岁|天|月|年|倍|小时)'
+_NUMERIC_CELL_RE = re.compile(
+    r'^\s*(?:约|近|不足|超过|超|≥|≤|>|<)?\s*'
+    r'[-+]?\d[\d,]*\.?\d*\s*' + _NUM_UNIT + r'?'
+    r'(?:\s*[-~～至]\s*[-+]?\d[\d,]*\.?\d*\s*' + _NUM_UNIT + r'?)?'
+    r'\s*$'
+)
+
+
+def _is_numeric_cell(value: str) -> bool:
+    """判断表格单元格是否为可画图的数值（支持约数、区间与复合单位）。"""
+    text = (value or "").strip()
+    if not text or len(text) > 40:
+        return False
+    if _NUMERIC_CELL_RE.match(text):
+        return True
+    # “突破80亿元”“1.2万家”“60余家”等：数值+单位之后只允许极短尾巴，
+    # 避免把“28家，居全国首位”这类正文误判成数值列
+    m = re.search(r'[-+]?\d[\d,]*\.?\d*\s*(?:余|多|\+)?\s*' + _NUM_UNIT, text)
+    if not m:
+        return False
+    return len(text[m.end():].strip()) <= 2
+
+
+def _parse_numeric_value(value: str) -> Optional[float]:
+    """从表格单元格提取数值：时间区间取时长，其他区间取左端。"""
+    text = (value or "").replace(" ", "")
+    span = re.search(r'(\d+(?:\.\d+)?)\s*[-~～至—–－]\s*(\d+(?:\.\d+)?)\s*(?:个月|月|天|周|年)', text)
+    if span:
+        return float(span.group(2)) - float(span.group(1))
+    m = re.search(r'[-+]?\d[\d,]*\.?\d*', text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _numeric_unit(value: str) -> str:
+    """提取单元格中的主要单位，用于把同量纲数据画在同一张图。"""
+    m = re.search(_NUM_UNIT, (value or "").replace(" ", ""))
+    return m.group(0) if m else ""
+
+
 class ChartGenerator:
     BUSINESS_COLORS = ['#2E75B6', '#ED7D31', '#A5A5A5', '#FFC000', '#5B9BD5',
                        '#70AD47', '#264478', '#9E480E', '#636363', '#4472C4']
@@ -196,7 +232,12 @@ class ChartGenerator:
         self.output_dir = output_dir
         self.llm = llm
 
-    def extract_data(self, desc: str, evidence: str) -> Optional[Dict]:
+    def extract_data(self, desc: str, evidence: str, table_md: str = "") -> Optional[Dict]:
+        if table_md:
+            data = self._table_to_chart_data(desc, table_md)
+            if data:
+                return data
+
         prompt = f"""【任务】从素材中提取"{desc}"相关的图表数据
 【素材】{smart_truncate(evidence, 4000)}
 
@@ -238,6 +279,56 @@ class ChartGenerator:
             logger.debug(f"[LLM提取失败] {e}")
         return self._regex_extract(desc, evidence)
 
+    def _table_to_chart_data(self, desc: str, table_md: str) -> Optional[Dict]:
+        """直接把 Markdown 表格转成图表数据，避免只拿表头去素材里猜。"""
+        lines = [l.strip() for l in table_md.strip().split("\n") if l.strip().startswith("|")]
+        if len(lines) < 3:
+            return None
+
+        def _cells(line: str) -> List[str]:
+            return [c.strip() for c in line.strip("|").split("|")]
+
+        headers = _cells(lines[0])
+        rows = [_cells(line) for line in lines[2:]]
+        rows = [r for r in rows if len(r) >= 2]
+        if len(rows) < 2:
+            return None
+
+        ncols = min([len(headers)] + [len(r) for r in rows])
+        # 同一列里按单位分组，只画同量纲的 2 条以上数据，避免亿元和 % 混在一张图
+        best = None  # (列号, [(行号, 数值)], 单位)
+        for c in range(1, ncols):
+            header = headers[c] if c < len(headers) else ""
+            # 来源/编号列常含 [S1]、[1]，会被误读成 1、3 之类的数值
+            if re.search(r'来源|编号|序号|代码|引用|链接|URL', header, re.I):
+                continue
+            groups: Dict[str, List[Tuple[int, float]]] = {}
+            for idx, row in enumerate(rows):
+                cell = row[c].strip()
+                if cell.startswith(('[', '【')):
+                    continue
+                value = _parse_numeric_value(cell)
+                if value is None:
+                    continue
+                groups.setdefault(_numeric_unit(cell), []).append((idx, value))
+            for unit, items in groups.items():
+                if len(items) >= 2 and (best is None or len(items) > len(best[1])):
+                    best = (c, items, unit)
+        if not best:
+            return None
+
+        col, items, unit = best
+        return {
+            "type": "auto",
+            "title": desc,
+            "unit": unit,
+            "labels": [rows[idx][0] for idx, _ in items],
+            "series": [{
+                "name": headers[col] or "数值",
+                "values": [v for _, v in items],
+            }],
+        }
+
     def _regex_extract(self, desc: str, text: str) -> Optional[Dict]:
         table_rows = re.findall(r'\|\s*([^\|\n]+?)\s*\|\s*(\d+[\.,]?\d*)\s*\|', text)
         if table_rows and len(table_rows) >= 3:
@@ -261,100 +352,6 @@ class ChartGenerator:
             return {"type": "line", "title": desc, "unit": unit.group(0) if unit else "",
                     "labels": labels, "series": [{"name": "数值", "values": values}]}
         return None
-
-    def _augment_with_forecast(self, data: Dict, ctype: str) -> Optional[Dict]:
-        """
-        对时间序列数据自动追加 TimesFM 预测值。
-
-        检测条件：
-        - 图表类型为 line/area
-        - labels 为年份格式（20xx）
-        - values 有 >=3 个数据点
-        - TimesFM 可用
-
-        返回修改后的 data（追加预测 series 和未来年份 labels），
-        或 None（预测不可用/不适用）。
-        """
-        if not TIMESFM_AVAILABLE:
-            return None
-        if ctype not in ("line", "area"):
-            return None
-
-        labels = data.get("labels", [])
-        series = data.get("series", [])
-        if not series or not labels:
-            return None
-
-        values = series[0].get("values", [])
-        if len(values) < 3:
-            return None
-
-        # 检测年份标签
-        years = []
-        for lbl in labels:
-            m = re.match(r'^(20\d{2})$', str(lbl))
-            years.append(int(m.group(1)) if m else None)
-        if not all(years):
-            return None
-
-        try:
-            predictor = TimesFMPredictor(lazy=True)
-            if not predictor.is_available():
-                return None
-
-            # 预测步数 = 数据长度的 1/3，最少 3 步，最多 6 步
-            forecast_horizon = max(3, min(len(values) // 3, 6))
-            point, quantile = predictor.predict(values, horizon=forecast_horizon)
-
-            # 生成未来年份标签
-            last_year = years[-1]
-            future_labels = [str(last_year + i + 1) for i in range(forecast_horizon)]
-
-            # 构造预测数据：合并历史 + 预测
-            forecast_values = point.tolist()
-            p10_values = quantile[:, 0].tolist()
-            p90_values = quantile[:, -1].tolist()
-
-            # 修改原始数据：追加预测年份
-            data["labels"] = labels + future_labels
-            # 历史值用 None 补齐预测部分
-            data["series"][0]["values"] = values + [None] * forecast_horizon
-
-            # 追加预测 series
-            data["series"].append({
-                "name": "预测值",
-                "values": [None] * len(values) + forecast_values,
-                "type": "line",
-                "line": {"dash": "dash", "color": "#ED7D31"}
-            })
-
-            # 追加置信区间
-            data["series"].append({
-                "name": "预测上界(P90)",
-                "values": [None] * len(values) + p90_values,
-                "type": "line",
-                "line": {"dash": "dot", "color": "#A5A5A5", "width": 1}
-            })
-            data["series"].append({
-                "name": "预测下界(P10)",
-                "values": [None] * len(values) + p10_values,
-                "type": "line",
-                "line": {"dash": "dot", "color": "#A5A5A5", "width": 1}
-            })
-
-            # 更新图表类型为 combo（历史折线+虚线预测）
-            data["type"] = "combo"
-            data["chart_hint"] = "model_forecast"
-
-            logger.info(
-                f"[TimesFM] 预测 {len(values)}→{forecast_horizon} 步, "
-                f"趋势: {'↑' if forecast_values[-1] > values[-1] else '↓'}"
-            )
-            return data
-
-        except Exception as e:
-            logger.debug(f"[TimesFM预测失败] {e}")
-            return None
 
     def _auto_select_chart(self, data: Dict) -> str:
         """增强智能选型——基于数据特征分析"""
@@ -452,7 +449,7 @@ class ChartGenerator:
             if not raw or "SKIP" in raw.upper():
                 return None
             # 清洗markdown代码块标记
-            raw = re.sub(r'^```mermaid\\s*', '', raw, flags=re.MULTILINE)
+            raw = re.sub(r'^```mermaid\s*', '', raw, flags=re.MULTILINE)
             raw = re.sub(r'^```\s*', '', raw, flags=re.MULTILINE)
             raw = raw.strip()
             if not raw:
@@ -469,10 +466,14 @@ class ChartGenerator:
             # 尝试 mermaid-cli 渲染PNG
             png_ok = False
             try:
-                import subprocess
+                import subprocess, shutil
+                # Windows 下 mmdc 是 .cmd，subprocess 不会自动补 PATHEXT，先解析全路径
+                mmdc = shutil.which("mmdc")
+                if not mmdc:
+                    raise FileNotFoundError("mmdc")
                 result = subprocess.run(
-                    ['mmdc', '-i', mmd_path, '-o', png_path, '-s', '2', '-b', 'white'],
-                    capture_output=True, text=True, timeout=15
+                    [mmdc, '-i', mmd_path, '-o', png_path, '-s', '2', '-b', 'white'],
+                    capture_output=True, text=True, timeout=30
                 )
                 if result.returncode == 0 and os.path.exists(png_path) and os.path.getsize(png_path) > 200:
                     png_ok = True
@@ -620,11 +621,14 @@ class ChartGenerator:
             logger.warning(f"[沙箱Matplotlib生成失败] {e}")
             return None
 
-    def generate(self, idx: int, desc: str, evidence: str) -> Optional[Tuple[str, str]]:
+    def generate(self, idx: int, desc: str, evidence: str, table_md: str = "") -> Optional[Tuple[str, str]]:
         if not PLOTLY_AVAILABLE:
             return None
 
-        data = self.extract_data(desc, evidence)
+        if table_md:
+            evidence = (table_md + "\n" + evidence).strip()
+
+        data = self.extract_data(desc, evidence, table_md)
         if not data:
             # Plotly失败 → Mermaid → Matplotlib沙箱 三级fallback
             logger.info(f"[Plotly跳过] {desc} 无提取到数据，尝试Mermaid...")
@@ -637,12 +641,6 @@ class ChartGenerator:
         ctype = data.get("type", "auto")
         if ctype == "auto":
             ctype = self._auto_select_chart(data)
-
-        # 时间序列数据自动追加 TimesFM 预测
-        forecast_data = self._augment_with_forecast(data, ctype)
-        if forecast_data:
-            data = forecast_data
-            ctype = data.get("type", ctype)
 
         try:
             fig = self._create_figure(data, ctype)
@@ -789,6 +787,9 @@ class MarkdownDocxCompiler:
         style.font.name = "微软雅黑"
         style._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
         style.font.size = Pt(10.5)
+        # 紧凑行距与段后距，避免正文页数虚高
+        style.paragraph_format.line_spacing = 1.15
+        style.paragraph_format.space_after = Pt(3)
 
     def _make_run(self, paragraph, text: str, bold: bool = False, italic: bool = False, 
                   font_name: str = "微软雅黑", font_size: Pt = None, color: RGBColor = None):
@@ -824,11 +825,14 @@ class MarkdownDocxCompiler:
                 i += 1
                 continue
             if stripped.startswith("### "):
-                self.doc.add_heading(stripped[4:], level=3)
+                # 带“第X章”的是章标题（H2），其余是子节（H3）
+                _t = stripped[4:]
+                _lv = 2 if re.match(r'^第[一二三四五六七八九十百\d]+章', _t) else 3
+                self.doc.add_heading(_t, level=_lv)
                 i += 1
                 continue
             if stripped.startswith("#### "):
-                self.doc.add_heading(stripped[5:], level=4)
+                self.doc.add_heading(stripped[5:], level=3)
                 i += 1
                 continue
 
@@ -890,35 +894,55 @@ class MarkdownDocxCompiler:
     def _render_table(self, lines: List[str]):
         if len(lines) < 2:
             return
-        header_cells = [c.strip() for c in lines[0].split("|") if c.strip() != ""]
+
+        def _split_cells(line: str) -> List[str]:
+            """按管道符拆单元格，保留空单元格以免列错位。"""
+            s = line.strip()
+            if s.startswith("|"):
+                s = s[1:]
+            if s.endswith("|"):
+                s = s[:-1]
+            return [c.strip() for c in s.split("|")]
+
+        def _is_separator(line: str) -> bool:
+            """是否为 |---|---| 分隔行。"""
+            s = line.strip().strip("|").strip()
+            return bool(s) and "-" in s and re.fullmatch(r"[\s:\-|]+", s) is not None
+
+        header_cells = _split_cells(lines[0])
         rows = []
-        for line in lines[2:]:
-            cells = [c.strip() for c in line.split("|") if c.strip() != ""]
+        start = 1
+        if _is_separator(lines[1]):
+            start = 2
+        for line in lines[start:]:
+            if _is_separator(line):
+                continue
+            cells = _split_cells(line)
             if cells:
                 rows.append(cells)
 
         if not header_cells:
             return
 
-        table = self.doc.add_table(rows=1 + len(rows), cols=len(header_cells))
+        cols = len(header_cells)
+        table = self.doc.add_table(rows=1 + len(rows), cols=cols)
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.style = 'Light Grid Accent 1'
 
         hdr_cells = table.rows[0].cells
-        for j, h in enumerate(header_cells):
+        for j in range(cols):
             hdr_cells[j].text = ""
             p = hdr_cells[j].paragraphs[0]
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            self._make_run(p, h, bold=True, font_size=Pt(10))
+            self._make_run(p, header_cells[j] if j < len(header_cells) else "", bold=True, font_size=Pt(9))
 
         for i, row in enumerate(rows):
             row_cells = table.rows[i+1].cells
-            for j, val in enumerate(row):
-                if j < len(row_cells):
-                    row_cells[j].text = ""
-                    p = row_cells[j].paragraphs[0]
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    self._make_run(p, val)
+            for j in range(cols):
+                row_cells[j].text = ""
+                p = row_cells[j].paragraphs[0]
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                self._make_run(p, row[j] if j < len(row) else "", font_size=Pt(9))
 
         self.doc.add_paragraph()
 
@@ -939,20 +963,41 @@ class DeliverableCompiler:
             return
 
         full = "\n".join(chapters_md)
-        markers = re.findall(r"【图表：(.*?)】", full)
+        markers = [(m, "") for m in re.findall(r"【图表：(.*?)】", full)]
 
-        # 主动扫描Markdown表格，自动添加为图表标记
-        table_pattern = re.compile(r'\|.*\|.*\|\n\|[\s\-:]+\|[\s\-:]+\|')
-        table_matches = table_pattern.findall(full)
-        if table_matches:
-            logger.info(f"[表格检测] 发现 {len(table_matches)} 个Markdown表格，自动生成图表")
-            for i, tbl_match in enumerate(table_matches):
-                # 提取表格第一行作为图表描述
-                first_row = tbl_match.split('\n')[0]
-                cells = [c.strip() for c in first_row.split('|') if c.strip()]
-                tbl_desc = f"数据对比：{' vs '.join(cells[:3])}"
-                if tbl_desc not in markers:
-                    markers.append(tbl_desc)
+        # 主动扫描Markdown表格：仅数值型表格生成图表，文本对比表保留原表格
+        lines_all = full.split('\n')
+        table_count = 0
+        for i in range(len(lines_all) - 1):
+            head = lines_all[i].strip()
+            sep = lines_all[i + 1].strip()
+            if not (head.startswith('|') and re.fullmatch(r'\|[\s:\-|]+\|', sep)):
+                continue
+            table_count += 1
+            cells = [c.strip() for c in head.strip('|').split('|') if c.strip()]
+            tbl_desc = f"数据对比：{' vs '.join(cells[:3])}"
+            data_rows = []
+            j = i + 2
+            while j < len(lines_all) and lines_all[j].strip().startswith('|'):
+                data_rows.append(lines_all[j].strip())
+                j += 1
+            # 至少有一列在两行以上是数字（排除 URL 列），才视为数值表
+            cols = max(1, len(cells))
+            col_numeric = [0] * cols
+            for row in data_rows:
+                vals = row.strip('|').split('|')
+                for k in range(min(cols, len(vals))):
+                    v = vals[k].strip()
+                    if k > 0 and _is_numeric_cell(v) \
+                            and not v.lower().startswith(('http', 'www')):
+                        col_numeric[k] += 1
+            if not any(n >= 2 for n in col_numeric):
+                logger.info(f"[图表跳过] {tbl_desc} 为文本对比表，保留原表格")
+                continue
+            if tbl_desc not in [m[0] for m in markers]:
+                markers.append((tbl_desc, "\n".join(lines_all[i:j])))
+        if table_count:
+            logger.info(f"[表格检测] 发现 {table_count} 个Markdown表格，其中数值型 {len(markers)} 个生成图表")
 
         if not markers:
             return
@@ -973,7 +1018,7 @@ class DeliverableCompiler:
                 logger.warning(f"[图表证据] 向量索引失败，改用空证据: {e}")
                 mini_store = None
 
-        for i, desc in enumerate(markers[:10], 1):
+        for i, (desc, table_md) in enumerate(markers[:4], 1):
             related = []
             if mini_store:
                 try:
@@ -981,58 +1026,155 @@ class DeliverableCompiler:
                 except Exception as e:
                     logger.debug(f"[图表证据] 检索失败: {e}")
             evidence = "\n".join([f"[{r['meta']['idx']}] {smart_truncate(r['text'], 500)}" for r in related])
-            result = self.chart_gen.generate(i, desc, evidence)
+            result = self.chart_gen.generate(i, desc, evidence, table_md)
             if result:
                 png_path, html_path = result
-                self.chart_paths.append(("image", png_path, desc))
-                if html_path:
+                # .mmd 是 Mermaid 源文件，不能按图片嵌入
+                chart_type = "mermaid" if isinstance(png_path, str) and png_path.lower().endswith(".mmd") else "image"
+                self.chart_paths.append((chart_type, png_path, desc))
+                if html_path and str(html_path).lower().endswith(".html"):
                     self.chart_data.append({"title": desc, "html_file": html_path, "type": "advanced"})
             else:
                 logger.info(f"[图表跳过] {desc} 无数据，不插入占位符")
+
+    def _plan_chart_placements(self, chapters_md: List[str]):
+        """把已生成图表分配到具体章节。
+
+        返回 (inline, tails)：
+        - inline: {(章节序号, 行号): 图表条目}，对应正文里的【图表：...】标记
+        - tails: {章节序号: [图表条目]}，章节无标记时按描述匹配或顺序补到章节末尾
+        这样保证每张已生成的图表都会进正文，不会被静默丢弃。
+        """
+        inline: Dict[Tuple[int, int], Tuple[str, str, str]] = {}
+        tails: Dict[int, List[Tuple[str, str, str]]] = {}
+        if not self.chart_paths or not chapters_md:
+            return inline, tails
+
+        used = [False] * len(self.chart_paths)
+
+        def _pick(desc: str) -> Optional[int]:
+            # 正文标记只按描述匹配；未匹配的图表留给后面按关键词分配，
+            # 避免把无关图表硬塞到生成失败的位置
+            for k, entry in enumerate(self.chart_paths):
+                if not used[k] and desc and (desc in entry[2] or entry[2] in desc):
+                    return k
+            return None
+
+        # 1) 正文显式标记优先
+        for ci, ch in enumerate(chapters_md):
+            for li, line in enumerate(ch.split("\n")):
+                m = re.search(r"【图表：(.*?)】", line)
+                if not m:
+                    continue
+                pick = _pick(m.group(1).strip())
+                if pick is not None:
+                    used[pick] = True
+                    inline[(ci, li)] = self.chart_paths[pick]
+
+        # 2) 剩余图表：按描述关键词匹配章节正文，匹配不到则按顺序轮流分配
+        rest = [k for k in range(len(self.chart_paths)) if not used[k]]
+        if rest:
+            rr = 0
+            for k in rest:
+                entry = self.chart_paths[k]
+                keywords = [w for w in re.split(r"[^\u4e00-\u9fa5A-Za-z0-9]+", entry[2]) if len(w) >= 2]
+                scores = [sum(ch.count(w) for w in keywords) for ch in chapters_md]
+                best = max(range(len(scores)), key=lambda x: scores[x]) if scores else -1
+                if best < 0 or scores[best] == 0:
+                    best = rr % len(chapters_md)
+                    rr += 1
+                tails.setdefault(best, []).append(entry)
+        return inline, tails
+
+    def _chart_docx_block(self, doc: Document, entry: Tuple[str, str, str]) -> bool:
+        """把单个图表条目渲染进 Word（图片居中；Mermaid 源码不塞进正文）。"""
+        img_type, img_data, desc = entry
+        if img_type == "mermaid" or (isinstance(img_data, str) and img_data.lower().endswith(".mmd")):
+            # 没有 mermaid 渲染器时，源码对读者无意义；保留原 Markdown 表格即可
+            logger.info(f"[图表跳过] {desc} 为 Mermaid 源码（mermaid-cli 不可用），正文保留原表格")
+            return False
+        if img_type == "image" and img_data and os.path.exists(img_data):
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run().add_picture(img_data, width=Inches(5.0))
+            return True
+
+        logger.warning(f"[图表缺失] {desc} 文件不存在：{img_data}")
+        return False
+
+    def _chart_md_block(self, entry: Tuple[str, str, str]) -> str:
+        """把单个图表条目转成 Markdown 块（供 pandoc 路径使用）。"""
+        img_type, img_data, desc = entry
+        if img_type == "mermaid" or (isinstance(img_data, str) and img_data.lower().endswith(".mmd")):
+            logger.info(f"[图表跳过] {desc} 为 Mermaid 源码（mermaid-cli 不可用），正文保留原表格")
+            return ""
+
+        if img_data and os.path.exists(img_data):
+            # pandoc 的 Markdown 里反斜杠是转义符，图片路径统一改用正斜杠
+            img_posix = str(img_data).replace("\\", "/")
+            return f"\n![{desc}]({img_posix})\n"
+
+        logger.warning(f"[图表缺失] {desc} 文件不存在：{img_data}")
+        return ""
 
     def _generate_executive_summary(self, chapters_md: List[str]) -> str:
         """精炼TLDR ≤150字，适合封面页展示。"""
         if not chapters_md:
             return ""
+
+        def _first_body_paragraph(ch: str) -> str:
+            """取章节首个非标题、非声明段落。"""
+            for block in (ch or "").split('\n\n'):
+                lines = [ln for ln in block.splitlines() if ln.strip()]
+                body = "\n".join(
+                    ln for ln in lines
+                    if not ln.lstrip().startswith(('#', '>'))
+                ).strip()
+                if body:
+                    return body
+            return ""
+
         combined = ""
         for ch in chapters_md:
-            para = ch.split('\n\n')[0][:200] if ch else ""
+            # AI 训练知识章节没有可核验来源，不进入封面核心发现
+            if "【AI训练知识】" in (ch or ""):
+                continue
+            para = _first_body_paragraph(ch)[:300]
             if para:
                 combined += para + "\n"
         combined = smart_truncate(combined, 4000)
-        prompt = f"""【任务】从报告各章首段提取核心发现
-【输入】报告各章首段内容
+        prompts = [
+            f"请总结下面内容，输出3条要点；每条尽量包含一个具体数据或结论，不要编造数字。\n\n{combined}",
+            f"用3条要点概括下面的内容：\n\n{combined}",
+        ]
 
-【提取规则】
-1. 提取3-5条核心发现
-2. 每条≤30字，必须包含1个具体数据点
-3. 最后给出1条一句话行动建议
-4. 严禁空话，必须用报告中最接近的实际数据
-
-【输出格式】
-• 核心发现1（含具体数据）
-• 核心发现2（含具体数据）
-• 核心发现3（含具体数据）
-→ 行动建议（一句话，基于数据）
-
-【示例】
-• 市场规模约5000亿元
-• 第一梯队占比62%
-→ 建议对标头部企业CDM模式"""
-
-
-        try:
-            result = self.llm.editor([{"role":"user","content":prompt}], max_tokens=400)
-            result = result.strip()
-            if len(result) < 20: raise ValueError("TLDR too short")
-            return result
-        except Exception as e:
-            logger.warning(f"[核心发现生成失败] {e}")
-            snippets = []
-            for ch in chapters_md:
-                first = ch.split('\n\n')[0].strip(); first = re.sub(r'^#{1,3}\s*第[^章]+章\s*','',first); first = re.sub(r'^#{1,3}\s*','',first)
-                if len(first)>20: snippets.append(first[:120])
-            return " • ".join(snippets)[:200] if snippets else "本报告基于互联网公开信息自动生成。"
+        last_error = ""
+        for prompt in prompts:
+            try:
+                # 这里需要生成新内容，不能用 editor 角色（其系统提示禁止新增内容）
+                result = self.llm.chat(
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=1200,
+                    temperature=0.3,
+                ).strip()
+                if len(result) < 20:
+                    last_error = "TLDR too short"
+                    continue
+                if any(m in result for m in ("未收到", "无法提取", "请提供")):
+                    last_error = f"TLDR 是占位回复：{result[:40]}"
+                    continue
+                return smart_truncate(result, 220)
+            except Exception as e:
+                last_error = str(e)
+        logger.warning(f"[核心发现生成失败] {last_error}")
+        snippets = []
+        for ch in chapters_md:
+            if "【AI训练知识】" in (ch or ""):
+                continue
+            first = _first_body_paragraph(ch)[:120]
+            if len(first) > 20:
+                snippets.append(first)
+        return " • ".join(snippets)[:200] if snippets else "本报告基于互联网公开信息自动生成。"
 
     def generate_excel_appendix(self, all_materials: List[Dict], report_path: str = ""):
         if not EXCEL_AVAILABLE or not self.cfg.get("enable_excel_appendix", True):
@@ -1237,6 +1379,7 @@ iframe{{border:none;border-radius:4px}}</style>
 
         # 章节内容 + 自动编号
         chapter_no = 0
+        numbered_chapters = []
         for i, ch_text in enumerate(chapters_md):
             lines = ch_text.split("\n")
             for j, line in enumerate(lines):
@@ -1245,36 +1388,35 @@ iframe{{border:none;border-radius:4px}}</style>
                     prefix = "###" if stripped.startswith("### ") else "##"
                     old_title = stripped[len(prefix) + 1:]
                     old_title = re.sub(r'^第[一二三四五六七八九十百\d]+章[\s:：、.]*', '', old_title).strip()
+                    # 去掉标题自带的中文序号（一、二、）与阿拉伯数字编号
+                    old_title = re.sub(r'^[一二三四五六七八九十]+[、.．]\s*', '', old_title).strip()
+                    num_match = re.match(r'^(\d+)\s*[.、．:：]\s*', old_title)
+                    old_title = re.sub(r'^\d+\s*[.、．:：]\s*', '', old_title).strip()
                     # 摘要章与参考文献不参与正文章节编号
                     if (i == 0 and ("摘要" in old_title or "概要" in old_title or "发现" in old_title)) \
                             or "参考文献" in old_title:
                         lines[j] = f"{prefix} {old_title}"
                     else:
-                        chapter_no += 1
+                        chapter_no = int(num_match.group(1)) if num_match else chapter_no + 1
                         cn_num = ["一","二","三","四","五","六","七","八","九","十"][chapter_no-1] if chapter_no <= 10 else str(chapter_no)
                         lines[j] = f"{prefix} 第{cn_num}章  {old_title}"
                     break
-            md_parts.append("\n".join(lines))
+            numbered_chapters.append("\n".join(lines))
 
-        # 图表引用（以文本形式嵌入）
-        chart_idx = 0
-        for i, ch_text in enumerate(chapters_md):
-            for line in ch_text.split("\n"):
-                match = re.search(r"【图表：(.*?)】", line.strip())
-                if match:
-                    desc = match.group(1)
-                    if chart_idx < len(self.chart_paths):
-                        entry = self.chart_paths[chart_idx]
-                        img_type = entry[0]
-                        img_data = entry[1]
-                        if img_type == "image" and img_data and os.path.exists(img_data):
-                            # pandoc 支持图片嵌入语法
-                            md_parts.append(f"\n![{desc}]({img_data})\n")
-                        elif img_type == "mermaid" and isinstance(img_data, str) and os.path.exists(img_data):
-                            with open(img_data, 'r', encoding='utf-8') as mf:
-                                mermaid_code = mf.read()
-                            md_parts.append(f"\n**[Mermaid图表：{desc}]**\n\n```\n{mermaid_code}\n```\n")
-                    chart_idx += 1
+        # 图表按章节注入：标记位置优先，无标记的按描述/顺序补到章节末尾
+        chart_inline, chart_tails = self._plan_chart_placements(numbered_chapters)
+        for ci, ch_text in enumerate(numbered_chapters):
+            blocks = []
+            for li, line in enumerate(ch_text.split("\n")):
+                if re.search(r"【图表：(.*?)】", line.strip()):
+                    entry = chart_inline.get((ci, li))
+                    if entry:
+                        blocks.append(self._chart_md_block(entry))
+                    continue
+                blocks.append(line)
+            for entry in chart_tails.get(ci, []):
+                blocks.append(self._chart_md_block(entry))
+            md_parts.append("\n".join(blocks))
 
         # 行动建议
         if action_plan and action_plan.strip():
@@ -1290,18 +1432,28 @@ iframe{{border:none;border-radius:4px}}</style>
 
         safe = re.sub(r'[^\w\u4e00-\u9fa5]', '_', report_title)[:40]
         path = os.path.join(self.output_dir, f"{safe}_{datetime.now().strftime('%m%d_%H%M')}.docx")
+        os.makedirs(self.output_dir, exist_ok=True)
 
         # ====== 优先使用 pandoc ======
+        # 注意：shared.md_to_docx.markdown_to_docx 在 pandoc 不可用/失败时会静默降级到
+        # 简化转换器并返回 True，那个转换器不支持表格和图表定位，会绕过下面的
+        # python-docx 降级渲染，所以这里只在 pandoc 真正可用时直接调用 pandoc。
         pandoc_success = False
         try:
-            from shared.md_to_docx import markdown_to_docx
-            pandoc_success = markdown_to_docx(full_md, path)
+            from shared.md_to_docx import is_pandoc_available, _convert_with_pandoc
+            if is_pandoc_available():
+                pandoc_success = _convert_with_pandoc(full_md, path)
         except Exception as e:
             logger.warning(f"[pandoc] 调研报告Word导出失败: {e}，回退到 python-docx")
 
         # ====== 降级到 python-docx（仅在 pandoc 失败时） ======
         if not pandoc_success:
             doc = Document()
+            # A4 页面 + 紧凑页边距，避免页数虚高
+            _sec = doc.sections[0]
+            _sec.page_width, _sec.page_height = Cm(21.0), Cm(29.7)
+            _sec.left_margin = _sec.right_margin = Cm(2.5)
+            _sec.top_margin = _sec.bottom_margin = Cm(2.3)
             compiler = MarkdownDocxCompiler(doc)
 
             # 封面页
@@ -1369,45 +1521,33 @@ iframe{{border:none;border-radius:4px}}</style>
                         prefix = "###" if stripped.startswith("### ") else "##"
                         old_title = stripped[len(prefix) + 1:]
                         old_title = re.sub(r'^第[一二三四五六七八九十百\d]+章[\s:：、.]*', '', old_title).strip()
+                        # 去掉标题自带的中文序号（一、二、）与阿拉伯数字编号
+                        old_title = re.sub(r'^[一二三四五六七八九十]+[、.．]\s*', '', old_title).strip()
+                        num_match = re.match(r'^(\d+)', old_title)
+                        old_title = re.sub(r'^\d+(?:\.\d+)*[.、]?\s*', '', old_title).strip()
                         if (i == 0 and ("摘要" in old_title or "概要" in old_title or "发现" in old_title)) \
                                 or "参考文献" in old_title:
                             lines[j] = f"{prefix} {old_title}"
                         else:
-                            chapter_no += 1
+                            chapter_no = int(num_match.group(1)) if num_match else chapter_no + 1
                             cn_num = ["一","二","三","四","五","六","七","八","九","十"][chapter_no-1] if chapter_no <= 10 else str(chapter_no)
                             lines[j] = f"{prefix} 第{cn_num}章  {old_title}"
                         break
                 chapters_with_numbers.append("\n".join(lines))
 
-            chart_idx = 0
-            for ch_text in chapters_with_numbers:
+            # 图表按章节注入：标记位置优先，无标记的按描述/顺序补到章节末尾
+            chart_inline, chart_tails = self._plan_chart_placements(chapters_with_numbers)
+            for ci, ch_text in enumerate(chapters_with_numbers):
                 lines = ch_text.split("\n")
                 i = 0
                 while i < len(lines):
                     line = lines[i]
                     stripped = line.strip()
 
-                    chart_match = re.search(r"【图表：(.*?)】", stripped)
-                    if chart_match:
-                        desc = chart_match.group(1)
-                        if chart_idx < len(self.chart_paths):
-                            entry = self.chart_paths[chart_idx]
-                            img_type = entry[0]
-                            img_data = entry[1]
-                            if img_type == "mermaid" or (isinstance(img_data, str) and img_data.endswith('.mmd')):
-                                if os.path.exists(img_data):
-                                    with open(img_data, 'r', encoding='utf-8') as mf:
-                                        mermaid_code = mf.read()
-                                    code_para = doc.add_paragraph()
-                                    code_run = code_para.add_run(f"[Mermaid图表：{desc}]\n{mermaid_code}")
-                                    code_run.font.size = Pt(8)
-                                    code_run.font.name = "Consolas"
-                            elif img_type == "image" and img_data and os.path.exists(img_data):
-                                p = doc.add_paragraph()
-                                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                                p.add_run().add_picture(img_data, width=Inches(5.8))
-                            # 删除不可达的elif分支（第1101行已覆盖mermaid文件路径情况）
-                            chart_idx += 1
+                    if re.search(r"【图表：(.*?)】", stripped):
+                        entry = chart_inline.get((ci, i))
+                        if entry:
+                            self._chart_docx_block(doc, entry)
                         i += 1
                         continue
 
@@ -1421,10 +1561,20 @@ iframe{{border:none;border-radius:4px}}</style>
                     if buffer_lines:
                         compiler.add_markdown("\n".join(buffer_lines))
 
+                # 无标记的图表补到本章末尾，保证不静默丢弃
+                for entry in chart_tails.get(ci, []):
+                    self._chart_docx_block(doc, entry)
+
             if action_plan and action_plan.strip():
                 doc.add_page_break()
                 doc.add_heading("行动建议", level=1)
                 compiler.add_markdown(action_plan)
+
+            # Pandoc 失败回退时也要保留来源追溯表
+            if source_appendix and source_appendix.strip():
+                doc.add_page_break()
+                doc.add_heading("来源追溯表", level=1)
+                compiler.add_markdown(source_appendix)
 
             doc.save(path)
 
@@ -1535,10 +1685,13 @@ iframe{{border:none;border-radius:4px}}</style>
             f"{safe}_{datetime.now().strftime('%m%d_%H%M')}_精炼版.docx")
 
         # ====== 优先使用 pandoc ======
+        # 只在 pandoc 真正可用时调用；否则用下方 python-docx 渲染，
+        # 避免 md_to_docx 的简化降级转换器绕过表格/图表渲染。
         pandoc_success = False
         try:
-            from shared.md_to_docx import markdown_to_docx
-            pandoc_success = markdown_to_docx(brief_md, docx_path)
+            from shared.md_to_docx import is_pandoc_available, _convert_with_pandoc
+            if is_pandoc_available():
+                pandoc_success = _convert_with_pandoc(brief_md, docx_path)
         except Exception as e:
             logger.warning(f"[精炼报告] pandoc 导出失败: {e}，回退到 python-docx")
 
@@ -1574,21 +1727,28 @@ iframe{{border:none;border-radius:4px}}</style>
 
             doc.add_paragraph()
 
-            # 正文：按 Markdown 标题/段落渲染
+            # 正文：按 Markdown 标题/段落/表格渲染
             compiler = MarkdownDocxCompiler(doc)
-            for line in brief.split("\n"):
-                stripped = line.strip()
+            lines = brief.split("\n")
+            i = 0
+            while i < len(lines):
+                stripped = lines[i].strip()
+                if stripped.startswith("|"):
+                    table_lines = []
+                    while i < len(lines) and lines[i].strip().startswith("|"):
+                        table_lines.append(lines[i].strip())
+                        i += 1
+                    compiler._render_table(table_lines)
+                    continue
                 if stripped.startswith("## "):
                     doc.add_heading(stripped[3:], level=1)
                 elif stripped.startswith("### "):
                     doc.add_heading(stripped[4:], level=2)
                 elif stripped.startswith("- ") or stripped.startswith("* "):
                     doc.add_paragraph(stripped, style='List Bullet')
-                elif stripped.startswith("| "):
-                    # 表格行：python-docx 表格渲染
-                    continue  # 精炼版表格用 MarkdownDocxCompiler 处理
                 elif stripped:
                     compiler.add_markdown(stripped)
+                i += 1
 
             doc.save(docx_path)
 

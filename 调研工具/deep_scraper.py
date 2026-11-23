@@ -11,7 +11,7 @@ Layer 2 定向深挖模块 —— 对 LLM 打分 Top N 的高价值 URL 做全�
 import os
 import requests
 from typing import List, Optional, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
 from config import logger
 
@@ -244,11 +244,10 @@ class DeepScraper:
                 logger.debug(f"[DeepScraper] 无法从 URL 提取标题关键词: {url}")
                 return None
 
-            # 构建搜索查询：报告名称 + 转载/引用关键词
+            # 构建搜索查询：报告名称 + 转载/引用关键词（最多 2 条，避免兜底搜索拖死整批抓取）
             search_queries = [
-                f'"{title_keywords}" 转载',
-                f'"{title_keywords}" 引用 数据',
-                f'"{title_keywords}" 摘要 要点',
+                f'"{title_keywords}" 转载 引用 摘要',
+                f'"{title_keywords}" 数据 要点',
             ]
 
             # 尝试搜索合法来源
@@ -379,22 +378,31 @@ class DeepScraper:
             return idx, item, text
 
         scraped_map: Dict[int, str] = {}
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(_do_scrape, orig_idx, item): orig_idx
-                for orig_idx, item in candidates
-            }
-            for fut in as_completed(futures):
+        executor = ThreadPoolExecutor(max_workers=5)
+        futures = {
+            executor.submit(_do_scrape, orig_idx, item): orig_idx
+            for orig_idx, item in candidates
+        }
+        try:
+            for fut in as_completed(futures, timeout=180):
                 try:
                     orig_idx, item, text = fut.result()
                     if text is not None:
                         scraped_map[orig_idx] = text
                 except Exception as e:
                     logger.debug(f"[DeepScraper] 线程异常: {e}")
+        except FuturesTimeout:
+            logger.warning(
+                f"[DeepScraper] 抓取超时（180s），已获取 {len(scraped_map)} 条，跳过剩余抓取"
+            )
+        finally:
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
 
         # ---------- 将全文写回结果 ----------
         for orig_idx, full_text in scraped_map.items():
-            item = results[orig_idx]
+            item = top_items[orig_idx]
             if isinstance(item, dict):
                 item["full_content"] = full_text
             else:

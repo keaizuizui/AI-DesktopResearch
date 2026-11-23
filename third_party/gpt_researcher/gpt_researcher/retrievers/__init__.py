@@ -9,14 +9,12 @@ from .semantic_scholar.semantic_scholar import SemanticScholarSearch
 from .searchapi.searchapi import SearchApiSearch
 from .serpapi.serpapi import SerpApiSearch
 from .serper.serper import SerperSearch
-from .tavily.tavily_search import TavilySearch
 from .exa.exa import ExaSearch
 from .mcp import MCPRetriever
 from .bocha.bocha import BoChaSearch
 from .deepseek.deepseek import DeepSeekSearch
 
 __all__ = [
-    "TavilySearch",
     "CustomRetriever",
     "Duckduckgo",
     "SearchApiSearch",

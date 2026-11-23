@@ -359,10 +359,10 @@ class ResearchConductor:
                 combined_context = " ".join(context)
                 self.logger.info(f"Combined context size: {len(combined_context)}")
                 return combined_context
-            return []
+            return ""
         except Exception as e:
             self.logger.error(f"Error during web search: {e}", exc_info=True)
-            return []
+            return ""
 
     def _get_mcp_strategy(self) -> str:
         """

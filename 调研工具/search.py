@@ -39,6 +39,7 @@ except ImportError:
 
 # 多路线调度
 from shared.billing import RouteDispatcher
+from shared.search.models import CLAIM_NATURES, CLAIM_UNKNOWN
 
 
 def _get_tier_from_url(url: str) -> str:
@@ -365,17 +366,38 @@ def _extract_plan_key_info(plan_text: str) -> tuple:
 
 
 def _build_enriched_query(refined_task: str, plan_text: str) -> str:
-    """构建精简查询——只传方向摘要+核心追问，上限400字。"""
+    """构建精简查询——任务主体 + 最多 3 个方向标题，上限 150 字。
+
+    注意：不要把“方向一、xxx、方向二、xxx”这类长句碎片拼进来，
+    否则 GPTR 会拿整段任务当搜索词，召回广告页/报告列表页。
+    """
     directions, core_questions = _extract_plan_key_info(plan_text)
-    task_brief = refined_task[:200].rsplit('\n', 1)[0] if '\n' in refined_task[:200] else refined_task[:200]
-    parts = [task_brief]
-    if directions:
-        short_dirs = [d.split('：')[0].split(':')[0][:20] for d in directions[:5]]
-        parts.append(f"重点方向：{'、'.join(short_dirs)}")
-    if core_questions:
-        parts.append(f"核心问题：{core_questions[0][:80]}")
+
+    def _clean_direction(d: str) -> str:
+        d = (d or "").strip()
+        # "方向一：三重监管..."先去掉方向编号，保留真正标题
+        m = re.match(r'^方向[一二三四五六七八九十\d]+[、：:.\s]*(.*)$', d)
+        if m and m.group(1).strip():
+            d = m.group(1).strip()
+        head = re.split(r'[：:\n]', d, maxsplit=1)[0].strip()
+        # 去掉括号注释，避免查询词被截断在“（”处
+        head = re.sub(r'[（(][^）)]*[）)]', '', head).strip()
+        return re.sub(r'^\*+|\*+$', '', head).strip()[:16]
+
+    # 任务主体取第一段，只切掉已知的补充段落标记，避免误伤【调研主题】这类主体
+    task_brief = re.split(r'【\s*(?:用户补充信息|澄清问题自动回答|建议调研方向|核心追问)', refined_task, maxsplit=1)[0].strip()
+    task_brief = (task_brief or refined_task)[:120].rstrip('。；;，,')
+    parts = [task_brief] if task_brief else []
+    # 优先取“方向X”标题行，避免把方向下的解释段当成关键词
+    dir_titles = [d for d in directions if d.strip().startswith("方向")]
+    source = dir_titles or directions
+    short_dirs = [s for s in (_clean_direction(d) for d in source[:3]) if s]
+    if short_dirs:
+        parts.append("；".join(short_dirs))
+    elif core_questions:
+        parts.append(core_questions[0][:40])
     query = "。".join(parts)
-    return query[:400]
+    return query[:150]
 
 
 def _build_parallel_queries(refined_task: str, plan_text: str, max_queries: int = 3) -> List[str]:
@@ -485,7 +507,7 @@ class GPTRResearcherAdapter:
             time.monotonic() + _GPTR_COOLDOWN_SECONDS
         )
         logger.warning(
-            f"[GPTR Service] {reason}（{self._gptr_base_url}），已切换到 DeepSeek Search，"
+            f"[GPTR Service] {reason}（{self._gptr_base_url}），已熔断，"
             f"{_GPTR_COOLDOWN_SECONDS // 60} 分钟内不再尝试"
         )
 
@@ -621,6 +643,8 @@ class GPTRResearcherAdapter:
             raise
 
     async def conduct_research(self, plan_text: str, refined_task: str) -> str:
+        # 每次检索入口复位失败标志，避免上一次失败污染本次结果
+        self.last_call_failed = False
         # 构建富含规划信息的查询
         enriched_query = _build_enriched_query(refined_task, plan_text)
         logger.info(f"[GPT Researcher] enriched_query ({len(enriched_query)}字): {enriched_query[:200]}...")
@@ -632,6 +656,8 @@ class GPTRResearcherAdapter:
 
             # 通过 GPT-Researcher Service 执行研究（HTTP调用）
             report = await self._research_round(enriched_query)
+            if not report or len(report.strip()) < 200:
+                raise RuntimeError(f"GPTR 返回空上下文（{len((report or '').strip())} 字符）")
 
             # 域名黑名单过滤 —— 标记被屏蔽的源
             filtered_lines = []
@@ -652,9 +678,17 @@ class GPTRResearcherAdapter:
         except _GPTRServiceUnavailable:
             pass  # 熔断已在 _trip_circuit 记录唯一一条 WARNING
         except asyncio.TimeoutError:
-            logger.warning("[GPT Researcher] 搜索超时，降级到 DeepSeek Search")
+            logger.warning("[GPT Researcher] 搜索超时")
         except Exception as e:
-            logger.warning(f"[GPT Researcher] 调用失败: {e}，降级到 DeepSeek Search")
+            logger.warning(f"[GPT Researcher] 调用失败: {e}")
+
+        if not self.cfg.get("gptr_fallback_to_deepseek", False):
+            self.last_call_failed = True
+            logger.warning(
+                "[搜索失败] GPTR 不可用，且未启用 DeepSeek 自动补搜"
+                "（gptr_fallback_to_deepseek=False），按搜索失败处理"
+            )
+            return ""
 
         logger.info("[回退] 使用 DeepSeek Search 替代 GPT Researcher...")
         keywords = " ".join(re.findall(r'[\u4e00-\u9fa5]{2,6}|[a-zA-Z]{2,20}|20\d{2}', refined_task)[:12])
@@ -819,11 +853,20 @@ def parse_research_to_materials(raw_report: str, llm: LLMClient, plan_model: str
 【调研方向参考】请将每条素材的tags字段标注为对应的方向编号（如"方向1"、"方向2"）：
 {dir_list}
 """
-    prompt = f"""【任务】将研究报告拆解为结构化素材条目
+    def _parse_chunk(chunk: str) -> List[Dict]:
+        prompt = f"""【任务】将研究报告拆解为结构化素材条目
 【原则】每条素材只包含一个核心事实、数据或案例
+【跳过】纯导航/菜单/页脚、报告列表页、空白模板、乱码页面直接跳过，不要编造素材
+【软文处理】企业官网新闻、招商加盟页、品牌宣传稿不要整篇丢弃：
+只提取可核验的事实（主体、动作、数量、时间、价格与政策条款、合作方、门店/城市分布、产品型号），
+忽略“万亿蓝海、颠覆行业、独家IP、初心愿景、赋能升级”等评价性话术
+【来源判定】claim_nature 只能是以下三种之一：
+企业自述 —— 企业官网、招商页、品牌新闻稿、加盟广告
+第三方数据 —— 研究机构报告、政府部门、媒体调查、财报、学术论文
+未知 —— 无法判断
 {directions_hint}
 
-【报告内容】{smart_truncate(raw_report, 15000)}
+【报告内容】{chunk}
 
 【输出要求】
 - 只输出纯JSON数组，不要解释文字
@@ -836,30 +879,44 @@ def parse_research_to_materials(raw_report: str, llm: LLMClient, plan_model: str
     "url":"来源URL",
     "content":"核心事实/数据/案例（100-200字）",
     "tags":["方向1","方向2"],
-    "source_type":"report/news/official"
+    "source_type":"report/news/official/promo",
+    "claim_nature":"企业自述/第三方数据/未知"
   }}
 ]"""
-    for _ in range(2):
-        try:
-            raw = llm.plan([{"role": "user", "content": prompt}], model=plan_model, max_tokens=4000)
-            mats = safe_json_loads(raw, [])
-            if not isinstance(mats, list):
-                continue
-            seen = set()
-            cleaned = []
-            for m in mats:
-                if not isinstance(m, dict):
-                    continue
-                key = m.get("title", "") + str(m.get("content", ""))[:50]
-                if key not in seen:
-                    seen.add(key)
-                    cleaned.append(m)
-            return cleaned[:30]
-        except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as e:
-            # JSON解析或数据处理失败，等待后重试
-            logger.debug(f"[素材解析失败] {e}")
-            time.sleep(1)
-    return []
+        for attempt in range(2):
+            try:
+                raw = llm.plan([{"role": "user", "content": prompt}], max_tokens=6000)
+                mats = safe_json_loads(raw, [])
+                if isinstance(mats, list) and mats:
+                    return mats
+                logger.warning(
+                    f"[素材解析] 第{attempt+1}次未得到素材数组（LLM 返回 {len(raw or '')} 字）: {(raw or '')[:120]!r}"
+                )
+            except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as e:
+                logger.debug(f"[素材解析失败] {e}")
+                time.sleep(1)
+        return []
+
+    # 分片解析：单片过大时 LLM 输出会被 max_tokens 截断，导致 JSON 解析失败
+    chunk_size = 5000
+    all_mats: List[Dict] = []
+    for start in range(0, min(len(raw_report), 15000), chunk_size):
+        all_mats.extend(_parse_chunk(raw_report[start:start + chunk_size]))
+
+    seen = set()
+    cleaned = []
+    for m in all_mats:
+        if not isinstance(m, dict):
+            continue
+        key = m.get("title", "") + str(m.get("content", ""))[:50]
+        if key in seen:
+            continue
+        seen.add(key)
+        nature = str(m.get("claim_nature", "")).strip()
+        m["claim_nature"] = nature if nature in CLAIM_NATURES else CLAIM_UNKNOWN
+        cleaned.append(m)
+    logger.info(f"[素材解析] 解析出 {len(cleaned)} 条素材")
+    return cleaned[:30]
 
 
 class SearchManager:
@@ -936,11 +993,11 @@ class SearchManager:
             logger.info(f"[去重跳过] {query}")
             return []
 
-        # 检查缓存
-        cached_results = self.cache.get(query)
+        # 超长查询多为任务原文碎片，缓存结果不可靠，直接走真实搜索
+        cached_results = self.cache.get(query) if len(query) <= 50 else None
         if cached_results is not None:
             # 缓存命中，将dict转换回SearchResult
-            results = [SearchResult.from_dict(r) for r in cached_results]
+            results = [SearchResult.from_dict(r) for r in cached_results][:max_results]
             logger.info(f"[缓存命中] {query[:50]}... ({len(results)}条结果)")
             return results
 
@@ -1009,8 +1066,9 @@ class SearchManager:
         if deduped:
             cache_data = [r.to_dict() for r in deduped]
             self.cache.set(query, cache_data)
-        
-        return deduped
+
+        # 按请求上限截断，避免适配器返回超过 max_results 条（缓存保留完整集）
+        return deduped[:max_results]
 
     def multi_search(self, queries: List[str], max_results: int = 3,
                      workers: int = 5, aggressive: bool = False) -> List[SearchResult]:
@@ -1021,6 +1079,10 @@ class SearchManager:
                 try:
                     res = fut.result()
                     if res:
+                        # 标注每条结果的来源查询词，供溯源表使用
+                        q = futures[fut]
+                        for r in res:
+                            r.query = q
                         all_res.extend(res)
                 except Exception as e:
                     logger.warning(f"[并行搜索错误] {e}")
@@ -1144,7 +1206,7 @@ class SearchManager:
 【缺口列表】{json.dumps(gaps[:5], ensure_ascii=False)}
 
 【生成要求——必须覆盖三个维度】
-1. 时间维度：包含2024/2025/历史趋势的查询
+1. 时间维度：包含{datetime.now().year - 1}/{datetime.now().year}/历史趋势的查询
 2. 主体维度：覆盖市场规模/竞争格局/政策法规/风险挑战
 3. 反向维度：包含失败案例/争议/瓶颈的查询
 
@@ -1240,6 +1302,8 @@ class SearchManager:
         上服务器后（无Ollama依赖或embedding服务独立部署）可重新启用：
         设置 enable_gptr_parallel=True, gptr_parallel_queries=3
         """
+        # 检索入口复位失败标志，成功后不会残留上一次的 True
+        self.gptr.last_call_failed = False
         if self.cfg.get("enable_gptr_parallel", False):
             max_queries = self.cfg.get("gptr_parallel_queries", 3)
             report = await self.gptr.conduct_research_parallel(
@@ -1248,9 +1312,8 @@ class SearchManager:
         else:
             report = await self.gptr.conduct_research(plan_text, refined_task)
 
-        # 检查GPTR+DeepSeek是否彻底失败
-        if self.gptr.last_call_failed:
-            self.search_failure = True
+        # 按本次调用结果复位失败标志，避免上一次的 True 残留
+        self.search_failure = bool(self.gptr.last_call_failed)
         return report
 
     def _preprocess_results(self, results: List[SearchResult]) -> List[SearchResult]:

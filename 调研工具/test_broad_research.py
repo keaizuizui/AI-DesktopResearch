@@ -141,16 +141,6 @@ async def main():
             json.dump(result, f, ensure_ascii=False, indent=2)
         print("\n[完成] 测试结果已保存到 test_result.json")
         
-        # 如果有报告，运行并行监控分析
-        if hasattr(gui, 'final_report_path') and gui.final_report_path:
-            print("\n[分析] 运行并行质量监控...")
-            import subprocess
-            subprocess.run([
-                "python", "parallel_monitor.py",
-                "--report-path", gui.final_report_path,
-                "--output", "parallel_report.json"
-            ], check=False)
-        
     except Exception as e:
         print(f"\n[错误] {e}")
         import traceback

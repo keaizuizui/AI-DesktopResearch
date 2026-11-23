@@ -34,7 +34,7 @@ class OllamaConfig:
     """本地 Ollama 配置"""
     host: str = "http://localhost:11434"
     model: str = "EntropyYue/jina-embeddings-v2-base-zh"
-    enabled: bool = False
+    enabled: bool = True  # 关闭后压缩改用词面筛选，不再调用 embedding
 
 
 @dataclass
@@ -46,6 +46,7 @@ class ServiceConfig:
     task_timeout: int = 600
     keepalive_interval: int = 30
     log_level: str = "INFO"
+    min_report_chars: int = 200  # 报告最少字符数，低于此值视为空上下文
 
 
 class ConfigManager:
@@ -90,6 +91,7 @@ class ConfigManager:
         self.service.port = svc_cfg.get("port", self.service.port)
         self.service.max_concurrent_tasks = svc_cfg.get("max_concurrent_tasks", self.service.max_concurrent_tasks)
         self.service.task_timeout = svc_cfg.get("task_timeout", self.service.task_timeout)
+        self.service.min_report_chars = svc_cfg.get("min_report_chars", self.service.min_report_chars)
 
     def from_env(self):
         """
@@ -124,6 +126,7 @@ class ConfigManager:
             os.getenv("DEEPSEEK_API_KEY")
             or os.getenv("LLM_API_KEY")
             or self.search.deepseek_api_key
+            or self.llm.api_key
         )
         self.search.deepseek_endpoint = os.getenv("DEEPSEEK_SEARCH_ENDPOINT", self.search.deepseek_endpoint)
         self.search.provider = os.getenv("SEARCH_PROVIDER") or os.getenv("RETRIEVER", self.search.provider)
@@ -133,8 +136,21 @@ class ConfigManager:
         self.service.port = int(os.getenv("SERVICE_PORT") or os.getenv("GPTR_PORT", self.service.port))
         self.service.max_concurrent_tasks = int(os.getenv("MAX_CONCURRENT_TASKS", self.service.max_concurrent_tasks))
 
+        # 本地 embedding 开关与模型
+        host = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST", self.ollama.host)
+        if host and not host.startswith(("http://", "https://")):
+            # OLLAMA_HOST 常见写法是 127.0.0.1:11434，需要补协议头
+            host = "http://" + host
+        self.ollama.host = host
+        self.ollama.model = os.getenv("OLLAMA_MODEL", self.ollama.model)
+        enabled = os.getenv("OLLAMA_ENABLED")
+        if enabled is not None:
+            self.ollama.enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
+        if os.getenv("GPTR_DISABLE_EMBEDDING") == "1":
+            self.ollama.enabled = False
+
     def to_env_dict(self) -> Dict[str, str]:
-        return {
+        env = {
             "OPENAI_API_KEY": self.llm.api_key,
             "OPENAI_API_BASE": self.llm.base_url,
             "OPENAI_BASE_URL": self.llm.base_url,
@@ -146,7 +162,11 @@ class ConfigManager:
             "DEEPSEEK_API_KEY": self.search.deepseek_api_key,
             "DEEPSEEK_SEARCH_ENDPOINT": self.search.deepseek_endpoint,
             "OLLAMA_BASE_URL": self.ollama.host,
+            "OLLAMA_MODEL": self.ollama.model,
+            # GPTR 需要一个 embedding provider 才能初始化 Memory；
+            # 关闭本地 embedding 时仅停用压缩调用，不影响对象创建。
             "EMBEDDING": f"ollama:{self.ollama.model}",
+            "GPTR_DISABLE_EMBEDDING": "0" if self.ollama.enabled else "1",
             "MAX_SEARCH_RESULTS_PER_QUERY": str(self.search.max_results_per_query),
             "MAX_SCRAPER_WORKERS": str(self.search.max_scraper_workers),
             "TEMPERATURE": os.getenv("TEMPERATURE", str(self.llm.temperature)),
@@ -154,6 +174,7 @@ class ConfigManager:
             "REPORT_TYPE": os.getenv("REPORT_TYPE", "research_report"),
             "REPORT_TONE": os.getenv("REPORT_TONE", "Objective"),
         }
+        return env
 
     def apply_to_env(self):
         for key, value in self.to_env_dict().items():

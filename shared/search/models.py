@@ -24,6 +24,13 @@ class SourceGrade(str, Enum):
     C = "C"   # 低可信：未验证来源、内容农场 → 自动过滤
 
 
+# ─── 声明性质枚举（软文分层摘取用） ───
+CLAIM_SELF_PUBLISHED = "企业自述"
+CLAIM_THIRD_PARTY = "第三方数据"
+CLAIM_UNKNOWN = "未知"
+CLAIM_NATURES = (CLAIM_SELF_PUBLISHED, CLAIM_THIRD_PARTY, CLAIM_UNKNOWN)
+
+
 @dataclass
 class SearchResult:
     """
@@ -65,6 +72,11 @@ class SearchResult:
     score_reason: str = ""            # LLM评分理由（审计用）
     fact_card: str = ""               # 事实卡片HTML
     raw_html: str = ""                # 原始HTML内容
+
+    # ─── 溯源字段（可选，带默认值以兼容旧数据） ───
+    query: str = ""                   # 该结果来自哪条搜索查询
+    claim_nature: str = ""            # 企业自述 / 第三方数据 / ""（未判定）
+    source_group: str = ""            # 同品牌软文合并后的信源组标识
 
     def __post_init__(self):
         if not self.snippet and self.content:

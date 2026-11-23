@@ -9,7 +9,7 @@ def get_retriever(retriever: str):
     """Get a retriever class by name.
 
     Args:
-        retriever: The name of the retriever to get (e.g., 'google', 'tavily', 'duckduckgo').
+        retriever: The name of the retriever to get (e.g., 'google', 'deepseek', 'duckduckgo').
 
     Returns:
         The retriever class if found, None otherwise.
@@ -23,7 +23,7 @@ def get_retriever(retriever: str):
         - duckduckgo: DuckDuckGo search
         - bing: Bing search
         - arxiv: arXiv academic search
-        - tavily: Tavily search API
+        - deepseek: DeepSeek search API
         - exa: Exa search
         - semantic_scholar: Semantic Scholar academic search
         - pubmed_central: PubMed Central medical literature
@@ -71,10 +71,6 @@ def get_retriever(retriever: str):
             from gpt_researcher.retrievers import ArxivSearch
 
             return ArxivSearch
-        case "tavily":
-            from gpt_researcher.retrievers import TavilySearch
-
-            return TavilySearch
         case "exa":
             from gpt_researcher.retrievers import ExaSearch
 
@@ -144,8 +140,8 @@ def get_default_retriever():
     """Get the default retriever class.
 
     Returns:
-        The TavilySearch retriever class as the default search provider.
+        The DeepSeekSearch retriever class as the default search provider.
     """
-    from gpt_researcher.retrievers import TavilySearch
+    from gpt_researcher.retrievers import DeepSeekSearch
 
-    return TavilySearch
+    return DeepSeekSearch

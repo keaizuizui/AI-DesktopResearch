@@ -3,7 +3,7 @@ from langchain_community.retrievers import ArxivRetriever
 from gpt_researcher.patches.pdfplumber_loader import load_pdf_with_pdfplumber
 
 
-def scrape_pdf_with_pymupdf(url) -> str:
+def scrape_pdf_with_pdfplumber(url) -> str:
     """[PATCHED] 使用 pdfplumber (MIT) 替代 PyMuPDF"""
     return load_pdf_with_pdfplumber(url)
 

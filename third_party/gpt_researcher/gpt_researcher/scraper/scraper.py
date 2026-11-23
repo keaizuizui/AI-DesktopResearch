@@ -1,17 +1,14 @@
 """Web scraper module for GPT Researcher.
 
 This module provides the Scraper class that extracts content from URLs
-using various scraping backends (BeautifulSoup, PyMuPDF, Browser, etc.).
+using various scraping backends (BeautifulSoup, pdfplumber, Browser, etc.).
 """
 
 import asyncio
 import importlib
 import logging
-import subprocess
-import sys
 
 import requests
-from colorama import Fore, init
 
 from gpt_researcher.utils.workers import WorkerPool
 
@@ -21,8 +18,7 @@ from . import (
     BrowserScraper,
     FireCrawl,
     NoDriverScraper,
-    PyMuPDFScraper,
-    TavilyExtract,
+    PdfPlumberScraper,
     WebBaseLoaderScraper,
 )
 
@@ -42,8 +38,6 @@ class Scraper:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
         self.scraper = scraper
-        if self.scraper == "tavily_extract":
-            self._check_pkg(self.scraper)
         if self.scraper == "firecrawl":
             self._check_pkg(self.scraper)
         self.logger = logging.getLogger(__name__)
@@ -61,37 +55,26 @@ class Scraper:
         return res
 
     def _check_pkg(self, scrapper_name: str) -> None:
-        """
-        Checks and ensures required Python packages are available for scrapers that need
-        dependencies beyond requirements.txt. When adding a new scraper to the repo, update `pkg_map`
-        with its required information and call check_pkg() during initialization.
+        """检查抓取器依赖是否安装；缺依赖直接报错，不自动安装。
+
+        注意：上游版本会自动执行 pip install。本项目已移除该行为，
+        避免运行时静默安装依赖带来的供应链风险。
         """
         pkg_map = {
-            "tavily_extract": {
-                "package_installation_name": "tavily-python",
-                "import_name": "tavily",
-            },
             "firecrawl": {
                 "package_installation_name": "firecrawl-py",
                 "import_name": "firecrawl",
             },
         }
-        pkg = pkg_map[scrapper_name]
+        pkg = pkg_map.get(scrapper_name)
+        if not pkg:
+            return
         if not importlib.util.find_spec(pkg["import_name"]):
-            pkg_inst_name = pkg["package_installation_name"]
-            init(autoreset=True)
-            print(Fore.YELLOW + f"{pkg_inst_name} not found. Attempting to install...")
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", pkg_inst_name]
-                )
-                print(Fore.GREEN + f"{pkg_inst_name} installed successfully.")
-            except subprocess.CalledProcessError:
-                raise ImportError(
-                    Fore.RED
-                    + f"Unable to install {pkg_inst_name}. Please install manually with "
-                    f"`pip install -U {pkg_inst_name}`"
-                )
+            raise ImportError(
+                f"{pkg['package_installation_name']} not found. "
+                f"Please install manually with "
+                f"`pip install -U {pkg['package_installation_name']}`"
+            )
 
     async def extract_data_from_url(self, link, session):
         """
@@ -170,17 +153,16 @@ class Scraper:
           The `get_scraper` method returns the scraper class based on the provided link. The method
         checks the link to determine the appropriate scraper class to use based on predefined mappings
         in the `SCRAPER_CLASSES` dictionary. If the link ends with ".pdf", it selects the
-        `PyMuPDFScraper` class. If the link contains "arxiv.org", it selects the `ArxivScraper
+        `PdfPlumberScraper` class. If the link contains "arxiv.org", it selects the `ArxivScraper
         """
 
         SCRAPER_CLASSES = {
-            "pdf": PyMuPDFScraper,
+            "pdf": PdfPlumberScraper,
             "arxiv": ArxivScraper,
             "bs": BeautifulSoupScraper,
             "web_base_loader": WebBaseLoaderScraper,
             "browser": BrowserScraper,
             "nodriver": NoDriverScraper,
-            "tavily_extract": TavilyExtract,
             "firecrawl": FireCrawl,
         }
 

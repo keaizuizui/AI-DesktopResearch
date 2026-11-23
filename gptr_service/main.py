@@ -58,6 +58,14 @@ async def lifespan(app: FastAPI):
     config.from_env()
     config.apply_to_env()
     queue.configure(config.service.max_concurrent_tasks)
+
+    # 探测本地 embedding 能力，自动确定安全分块长度（失败则降级为词面筛选）
+    from core.embedding_check import probe_embedding
+    probe = await probe_embedding(config.ollama.host, config.ollama.model, config.ollama.enabled)
+    if not probe["enabled"]:
+        # 同步回配置，避免任务级 apply_to_env() 又把 embedding 打开
+        config.ollama.enabled = False
+
     logger.info(f"[Config] LLM: {config.llm.smart_model}/{config.llm.fast_model}")
     logger.info(f"[Config] Search: {config.search.provider}")
     logger.info(f"[Config] Max Concurrent: {config.service.max_concurrent_tasks}")

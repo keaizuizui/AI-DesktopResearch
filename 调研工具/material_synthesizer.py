@@ -137,7 +137,7 @@ class MaterialSynthesizer:
     但专门用于调研工具的素材聚类后综合，不含搜索逻辑。
 
     使用方式：
-        # 方式1: 传入 RoleBasedLLMClient（engine.llm）
+        # 方式1: 传入 LLMClient（engine.llm）
         synth = MaterialSynthesizer(llm=engine.llm)
 
         # 方式2: 传入 model_router（方案工具风格）
@@ -158,7 +158,7 @@ class MaterialSynthesizer:
 
     def __init__(
         self,
-        llm=None,           # RoleBasedLLMClient（engine.llm）
+        llm=None,           # LLMClient（engine.llm）
         model_router=None,  # ModelRouter（方案工具风格）
         max_materials_per_synthesis: int = 30,
         material_content_max_chars: int = 500,
@@ -166,7 +166,7 @@ class MaterialSynthesizer:
     ):
         """
         Args:
-            llm: RoleBasedLLMClient 实例（调研工具引擎的 self.llm）
+            llm: LLMClient 实例（调研工具引擎的 self.llm）
             model_router: ModelRouter 实例（备选，方案工具风格）
             max_materials_per_synthesis: 单次综合最多使用的素材数
             material_content_max_chars: 每条素材内容的最大字符数
@@ -448,7 +448,7 @@ class MaterialSynthesizer:
 仅输出 JSON。"""
 
     async def _call_role_based_llm(self, prompt: str) -> str:
-        """通过 RoleBasedLLMClient 调用 LLM（异步）"""
+        """通过 LLMClient 调用 LLM（异步）"""
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -463,7 +463,7 @@ class MaterialSynthesizer:
             return await self._to_async(self.llm.chat, messages, temperature=0.4)
 
     def _call_role_based_llm_sync(self, prompt: str) -> str:
-        """通过 RoleBasedLLMClient 调用 LLM（同步）"""
+        """通过 LLMClient 调用 LLM（同步）"""
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -751,7 +751,7 @@ def create_clusters_from_materials(
 
 class MaterialClusterer:
     """
-    素材聚类器 — 使用 Ollama + bge-m3 embedding 对全量素材做语义聚类
+    素材聚类器 — 使用 Ollama 本地 embedding 对全量素材做语义聚类
 
     核心流程：
     1. 对全部素材做 embedding（Ollama API）
@@ -760,7 +760,8 @@ class MaterialClusterer:
     4. 输出 List[MaterialCluster]
 
     与 MaterialSynthesizer 配合使用：
-        clusterer = MaterialClusterer(ollama_host="http://localhost:11434", ollama_model="bge-m3:latest")
+        clusterer = MaterialClusterer(ollama_host="http://localhost:11434",
+                                      ollama_model="EntropyYue/jina-embeddings-v2-base-zh:latest")
         clusters = clusterer.cluster(all_materials, min_clusters=5, max_clusters=8)
         synth = MaterialSynthesizer(llm=engine.llm)
         reports = synth.synthesize_all_sync(clusters, query="...")
@@ -775,7 +776,7 @@ class MaterialClusterer:
     def __init__(
         self,
         ollama_host: str = "http://localhost:11434",
-        ollama_model: str = "bge-m3:latest",
+        ollama_model: str = "EntropyYue/jina-embeddings-v2-base-zh:latest",
         embed_batch_size: int = 8,
         similarity_threshold: float = 0.5,
         min_cluster_size: int = 3,
@@ -816,7 +817,7 @@ class MaterialClusterer:
         vectors: List[Optional[List[float]]] = [None] * len(texts)
         ollama_down = False
         for start in range(0, len(texts), self.embed_batch_size):
-            batch = [t[:800] for t in texts[start:start + self.embed_batch_size]]
+            batch = [t[:600] for t in texts[start:start + self.embed_batch_size]]
             try:
                 r = self._requests.post(
                     f"{self.ollama_host}/api/embed",
@@ -1068,7 +1069,7 @@ class MaterialClusterer:
 
         Args:
             clusters: 聚类簇列表
-            llm: RoleBasedLLMClient 实例（可选）
+            llm: LLMClient 实例（可选）
 
         Returns:
             命名后的 MaterialCluster 列表

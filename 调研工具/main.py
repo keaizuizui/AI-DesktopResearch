@@ -37,8 +37,15 @@ class ResearchGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("小醉桌面研究 v1.0")
-        self.root.geometry("1450x1000")
-        self.root.minsize(1000, 700)
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(1450, max(1000, screen_w - 40))
+        # 预留任务栏 + 标题栏/边框高度（约 140px），避免窗口底部落到任务栏之下
+        win_h = min(1000, max(620, screen_h - 140))
+        # 顶部贴 0 定位，防止默认层叠偏移把底部按钮顶到任务栏下面
+        pos_x = max(0, (screen_w - win_w) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+0")
+        self.root.minsize(1000, 600)
         self._setup_theme()
 
         # ---------- 线程同步 ----------
@@ -216,6 +223,10 @@ class ResearchGUI:
         left_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 4), pady=4)
         left_outer.pack_propagate(False)
 
+        # 大纲操作按钮固定在左栏底部，不随滚动区域移出可见范围
+        self.action_bar = ttk.Frame(left_outer)
+        self.action_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=2, pady=(0, 4))
+
         left_canvas = tk.Canvas(left_outer, width=390, highlightthickness=0, bg=self.colors["bg"])
         left_scrollbar = ttk.Scrollbar(left_outer, orient=tk.VERTICAL, command=left_canvas.yview)
         left = ttk.Frame(left_canvas, padding=12)
@@ -270,15 +281,17 @@ class ResearchGUI:
         ttk.Label(left, text="控制面修改 / 反馈", style="Section.TLabel").pack(anchor=tk.W)
         feedback_frame, self.feedback_entry = self._make_text(left, height=4)
         feedback_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(left, text="例：改页数：第2章页数改5 ｜ 补搜：第2章补搜 竞争格局 2026",
+        ttk.Label(left, text="例：改页数：第2章页数改5 ｜ 补搜：第2章补搜 竞争格局，市场份额",
                   style="Hint.TLabel", wraplength=370).pack(anchor=tk.W, pady=(0, 4))
 
-        btn_frame = ttk.Frame(left)
-        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Separator(self.action_bar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 5))
+        btn_frame = ttk.Frame(self.action_bar)
+        btn_frame.pack(fill=tk.X)
         ttk.Button(btn_frame, text="确认通过", command=self.on_outline_confirm).pack(side=tk.LEFT, expand=True, padx=1)
         ttk.Button(btn_frame, text="应用修改", command=self.on_outline_edit).pack(side=tk.LEFT, expand=True, padx=1)
         ttk.Button(btn_frame, text="回炉重造", command=self.on_outline_remelt).pack(side=tk.LEFT, expand=True, padx=1)
         ttk.Button(btn_frame, text="补搜本章", command=self.on_outline_supplement).pack(side=tk.LEFT, expand=True, padx=1)
+        self.root.bind_all("<Control-Return>", self._on_confirm_shortcut)
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
         ttk.Label(left, text="当前状态", style="Section.TLabel").pack(anchor=tk.W)
@@ -426,7 +439,14 @@ class ResearchGUI:
         self.storm_var = tk.BooleanVar(value=self.config.get("enable_storm_debate", False))
         ttk.Checkbutton(sf, text="STORM 多角度辩论（增加 6–8 条查询，耗时更长）",
                         variable=self.storm_var).pack(anchor=tk.W, padx=20, pady=6)
-        ttk.Label(sf, text="默认关闭；打开后从支持者/质疑者/旁观者三个视角补充素材。",
+        ttk.Label(sf, text="默认关闭；打开后从支持者/质疑者/旁观者三个视角补充素材，查询计入搜索预算。",
+                  style="Hint.TLabel", wraplength=560).pack(anchor=tk.W, padx=20)
+
+        self.ai_fallback_var = tk.BooleanVar(
+            value=self.config.get("enable_ai_knowledge_fallback", True))
+        ttk.Checkbutton(sf, text="素材不足时用 AI 训练知识补章（标题标注【AI训练知识】）",
+                        variable=self.ai_fallback_var).pack(anchor=tk.W, padx=20, pady=6)
+        ttk.Label(sf, text="默认开启；关闭后日志会提示，可在【控制面修改】填关键词后点【补搜本章】重试。",
                   style="Hint.TLabel", wraplength=560).pack(anchor=tk.W, padx=20)
 
         ttk.Button(sf, text="保存配置", command=self.on_save_config,
@@ -485,7 +505,7 @@ class ResearchGUI:
         self.regular_budget_var = tk.StringVar(
             value=str(preset.get("max_search_budget", self.config.get("max_search_budget", 20))))
         self.regular_auto_supplement_var = tk.BooleanVar(
-            value=preset.get("auto_supplement", self.config.get("auto_supplement", False)))
+            value=preset.get("auto_supplement", self.config.get("auto_supplement", True)))
         self.regular_auto_fill_gaps_var = tk.BooleanVar(
             value=preset.get("auto_fill_final_gaps", self.config.get("auto_fill_final_gaps", True)))
         self.regular_fill_rounds_var = tk.StringVar(
@@ -506,7 +526,7 @@ class ResearchGUI:
         add_row("每批迭代", self.regular_iterations_var, 1, 3, "每批基于上一轮结果细化")
         add_row("每次搜索取数 Top K", self.regular_max_results_var, 3, 10, "每个查询保留结果数")
         add_row("搜索密度 Top K", self.regular_density_top_k_var, 3, 15, "空缺方向多维深挖保留数")
-        add_row("搜索预算", self.regular_budget_var, 5, 50, "总搜索次数上限")
+        add_row("搜索预算", self.regular_budget_var, 5, 50, "总搜索次数上限（主搜索、补搜、事实核查共用）")
         add_row("补搜轮次", self.regular_fill_rounds_var, 1, 3, "写作后补搜循环次数")
         add_row("每轮补搜信源", self.regular_fill_sources_var, 5, 30, "每轮最多抓取信源数")
 
@@ -562,7 +582,7 @@ class ResearchGUI:
         add_row("每批迭代", self.deep_iterations_var, 1, 5, "每批基于上一轮结果细化")
         add_row("每次搜索取数 Top K", self.deep_max_results_var, 5, 15, "每个查询保留结果数")
         add_row("搜索密度 Top K", self.deep_density_top_k_var, 5, 30, "空缺方向多维深挖保留数")
-        add_row("搜索预算", self.deep_budget_var, 10, 100, "总搜索次数上限")
+        add_row("搜索预算", self.deep_budget_var, 10, 100, "总搜索次数上限（主搜索、补搜、事实核查共用）")
         add_row("补搜轮次", self.deep_fill_rounds_var, 1, 5, "写作后补搜循环次数")
         add_row("每轮补搜信源", self.deep_fill_sources_var, 5, 20, "每轮最多抓取信源数")
 
@@ -926,6 +946,7 @@ class ResearchGUI:
             ke = KnowledgeExtractor(self.config, self.bot.llm)
             knowledge = ke.extract_from_report("\n".join(self._chapters_md))
 
+            materials = getattr(self.bot, "all_materials", None) or []
             data_points = []
             for dp in knowledge.data_points:
                 # 查找对应的素材和信源等级
@@ -939,16 +960,34 @@ class ResearchGUI:
                         from config import grade_source
                         source_grade = grade_source(url, content).value
                         break
-                
+                # 溯源两列：优先按已匹配到的 URL，其次按来源名在 URL/标题中的子串匹配
+                matched_material = None
+                material_index = ""
+                for idx, m in enumerate(materials, 1):
+                    m_url = getattr(m, "url", "") or ""
+                    m_title = getattr(m, "title", "") or ""
+                    if source_url:
+                        if m_url == source_url:
+                            matched_material = m
+                            material_index = str(idx)
+                            break
+                    elif dp.source and (dp.source in m_url or dp.source in m_title):
+                        matched_material = m
+                        material_index = str(idx)
+                        break
+
                 data_points.append({
-                    "metric": dp.metric,
+                    "name": dp.metric,
                     "value": dp.value,
+                    "unit": "",
                     "year": dp.year,
                     "source": dp.source or source_url,
-                    "source_url": source_url,
-                    "source_grade": source_grade,
+                    "tier": source_grade,
                     "confidence": "high" if source_grade in ["S", "A"] else "medium" if source_grade == "B" else "low",
-                    "expires_at": dp.expires_at,
+                    "verification_status": "待验证",
+                    "valid_until": dp.expires_at,
+                    "search_query": getattr(matched_material, "query", ""),
+                    "material_index": material_index,
                 })
             return data_points
         except Exception as e:
@@ -969,6 +1008,7 @@ class ResearchGUI:
 
         self.config["enable_deep_scrape"] = self.deep_scrape_var.get()
         self.config["enable_storm_debate"] = self.storm_var.get()
+        self.config["enable_ai_knowledge_fallback"] = self.ai_fallback_var.get()
 
         if save_config(self.config):
             apply_config_to_env(self.config)
@@ -976,6 +1016,11 @@ class ResearchGUI:
             self.set_status("配置已更新")
         else:
             self.config_status.config(text="保存失败")
+
+    def _on_confirm_shortcut(self, event=None):
+        """Ctrl+Enter 快捷确认，避免鼠标定位不到底部按钮。"""
+        if self.waiting_state:
+            self.on_outline_confirm()
 
     def on_outline_confirm(self):
         if self.waiting_state == 'outline_controls':
@@ -1035,7 +1080,7 @@ class ResearchGUI:
         text = self.feedback_entry.get("1.0", tk.END).strip()
         if self.waiting_state == 'outline_controls':
             if not text:
-                messagebox.showwarning("提示", "请输入补搜指令，如：第2章补搜 竞争格局 2026  或  补搜全部")
+                messagebox.showwarning("提示", "请输入补搜指令，如：第2章补搜 竞争格局，市场份额（多个关键词用逗号分隔）")
                 return
             self.outline_action = "supplement"
             self.outline_text = text

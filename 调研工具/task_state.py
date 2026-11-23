@@ -152,6 +152,13 @@ class TaskStateStore:
         self.data["current_stage"] = ""
         self._save()
 
+    def reset_stage(self, name: str):
+        """把阶段标记为未完成，任务恢复时会重新执行该阶段。"""
+        stage = self.data.setdefault("stages", {}).setdefault(name, {})
+        stage["status"] = "pending"
+        stage.pop("ended_at", None)
+        self._save()
+
     def attempt_failed(self, name: str, error: Exception, attempts: int):
         stage = self.data.setdefault("stages", {}).setdefault(name, {})
         stage["status"] = "running"

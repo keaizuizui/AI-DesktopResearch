@@ -70,16 +70,6 @@ sentry-sdk[fastapi]>=2.0.0   # 错误追踪与告警
 # ─── 可观测性（可选） ───
 langfuse>=2.0.0               # LLM调用链追踪（可选）
 
-# ─── PDF增强（可选） ───
-camelot-py[cv]>=0.11.0        # PDF复杂表格提取（需Ghostscript）
-
-# ─── 版面分析与OCR（可选） ───
-# PP-StructureV3 轻量版：版面检测 + OCR（~25MB），CPU可用
-# 安装：pip install paddlepaddle paddleocr
-# 使用：shared/document/ocr/ → OCRProvider.PPSTRUCTURE
-# paddle>=3.0.0                    # 飞桨框架（CPU版，默认）
-# paddleocr>=3.0.0                 # PaddleOCR（含PP-StructureV3）
-
 # ─── 网页提取增强（可选） ───
 # requests 已安装（Jina Reader 只需 requests）
 

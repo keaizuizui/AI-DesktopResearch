@@ -27,11 +27,19 @@
 
 在 2026 年即将过完之际，仍有很多人对 Agent 的理解是所谓的“自主规范”，却完全忽视了借助工程框架完全规训 AI 的优势。
 
-主流的 AI Agent 做法通常是给 LLM 一个工具箱和一个循环，让它自己决定“下一步做什么”。这种自由放任的模式会带来三类典型的失控：
+把现在市面上大多数所谓的 Agent 拆开来看，其实只有三件事：
+
+- 写一段 system prompt，定义角色和规则；
+- 注册几个 tool 和 skill（查数据、写报告）；
+- 用户输入一句话，模型挑一个或几个 tool 调用，再把结果组织成回答。
+
+本质上，它只是一个“用自然语言触发函数调用”的工具。这种模式看起来自由，实际会带来三类典型的失控：
 
 - 预算失控：模型觉得“信息还不够”就无限地再搜一轮；
 - 流程失控：模型擅自跳过该做的步骤或改变交付结构；
 - 内容失控：在没有素材支撑的情况下编造数据、品牌和案例。
+
+本项目想指出的正是深度 Agent 的未来方向：不是让模型多接几个工具，而是由工程代码承载流程、预算、证据与交付边界。
 
 这在针对一个具体的专业任务时，具有极大的不可控性。本项目把 AI 当作**有创造力的执行者**，而不是系统的主宰。工程代码负责把 AI 放在一个明确范围内，让它提供人味、结构和表达，但不让它越过证据、预算和流程边界。
 
@@ -78,6 +86,8 @@ AI 不可以：
 
 GPT Researcher 负责完成主要素材的抓取工作。素材抓取完成后，进行去重、分级、评估、聚类，随后生成扩写骨架。
 
+GPTR 的召回质量直接决定素材量：长 query 会被当成整句处理而不拆子查询，所以系统只传「任务主体 + 最多 3 个方向标题」的精简查询；返回的原始报告按 5000 字分片解析，避免单次长文本导致 JSON 截断、素材解析为 0。
+
 TTD-DR 框架基于骨架分层注入素材，扩写当前章节；最终所有章节按大纲顺序，注入前层认知串行完成。同时设定写作者、项目经理、审稿者三视角审查产出物，以保证跨章上下文一致。
 
 另设计了噪音识别功能：对无数据支撑的论断、缺案例的泛泛而谈和缺来源的数据，安排补搜或重写。
@@ -88,7 +98,7 @@ TTD-DR 框架基于骨架分层注入素材，扩写当前章节；最终所有�
 - 调研规划：方向、核心追问、搜索批次、覆盖度预检。
 - 搜索矩阵：批次数 × 迭代数 × Top K × 预算；常规/超深度/行业搜索三套策略。
 - 多源检索：GPT Researcher 为主搜引擎，DeepSeek Search 补搜接口；Playwright 为补充抓取，失败后切 DeepSeek Fetch。
-- 素材治理：去重、来源分级、相关性评分、主题聚类、分层注入。
+- 素材治理：去重、来源分级、相关性评分、主题聚类、分层注入；软文不整篇丢弃，只提取可核验事实并标注「企业自述」，同品牌多篇合并为一个信源。
 - 逐章扩写：素材不足时定向补搜；事实核查、批评改写、全篇统稿。
 - 缺口补搜：计划级、章节级、最终缺口三层补搜，受预算硬约束。
 - 质量复核：数据防坑、来源多样性、数据密度、章节均衡、声明账本。
@@ -120,7 +130,7 @@ TTD-DR 框架基于骨架分层注入素材，扩写当前章节；最终所有�
 
 ### 计划是一份合同
 
-计划包含调研方向、核心追问、搜索批次和风险提醒，但不允许规定“第一章几页”。章节结构必须由素材决定。计划确认后，搜索次数 = 批次数 × 迭代数，预算写死在 `ResearchState` 里；后面补什么、大纲够不够，都对照这份计划判断。
+计划包含调研方向、核心追问和搜索批次，但不允许规定“第一章几页”。章节结构必须由素材决定。风险提醒不再固定出现：只有需求明确涉及风险、合规或下行压力时才写，且不单独成章；检索计划与搜索批次也不进报告目录。计划确认后，搜索次数 = 批次数 × 迭代数，预算写死在 `ResearchState` 里；后面补什么、大纲够不够，都对照这份计划判断。
 
 ### 缺什么补什么，但绝不失控
 
@@ -133,6 +143,11 @@ TTD-DR 框架基于骨架分层注入素材，扩写当前章节；最终所有�
 ### 失败了，从断点继续
 
 阶段状态、素材、大纲、章节全部落盘。任务中断后，GUI 的“重试上次任务”会带上 `resume_task_id`，引擎跳过已完成阶段，已写章节直接复用。瞬时错误自动重试 2 次，退避 5 秒和 15 秒；非瞬时错误立即失败，不浪费重试。
+
+### 测试与回归
+
+- 四套自检：`test_guards.py`（11 项规则守卫）、`test_regression.py`（22 项综合回归）、`test_engine.py --quick`（7 项引擎）、`test_audit_fixes.py`（14 项审计修复）。
+- 节点资料库：`output/e2e_gui_review/测试资料库/` 把一次完整任务的过程产物按节点固化（计划书、批次、主题词、素材、骨架、章节、报告），用 `replay.py --node batches|materials|chapters` 离线回放下游逻辑，不必重跑 LLM 与搜索。
 
 更细的机制、阈值和代码位置见 [Wiki](docs/WIKI.md)。
 
@@ -198,16 +213,31 @@ python 调研工具\main.py
 
 | 服务 | 作用 | 不安装时 |
 |---|---|---|
-| Ollama + bge-m3 | 本地语义检索，提升素材召回 | 自动回退 BM25，不影响主流程 |
-| GPT Researcher | 主搜索与深度研究 | 自动回退 DeepSeek Search |
+| Ollama（本地 embedding） | 素材聚类、循环检测、GPTR 上下文压缩 | 自动回退词面/BM25，主流程不受影响 |
+| GPT Researcher | 主搜索与深度研究 | 任务失败并明确报错（可配置自动回退 DeepSeek） |
 | Playwright | 动态网页渲染 | 连续失败 3 次后切 DeepSeek Fetch |
 | matplotlib | 图表生成 | 跳过图表，并记录交付物状态 |
 
 Ollama：
 
 ```powershell
-ollama pull bge-m3
+ollama pull EntropyYue/jina-embeddings-v2-base-zh
 ```
+
+性能较差的电脑可按体积选择 embedding 模型，通过 `ollama_model`（调研工具）或 `OLLAMA_MODEL`（GPTR 服务）切换：
+
+| 模型 | 体积 | 维度 | 适用 |
+|---|---|---|---|
+| EntropyYue/jina-embeddings-v2-base-zh | 约 322 MB | 768 | 默认，中文优化，低配机器首选 |
+| nomic-embed-text | 约 274 MB | 768 | 更低配，多语言；中文效果一般 |
+| bge-m3 | 约 1.1 GB | 1024 | 高配，8k 上下文，长文本聚类更稳 |
+
+GPTR 服务启动时会实测当前模型的安全输入长度并自动调整压缩分块；模型未安装或 Ollama 连不上时，压缩自动改用词面筛选，不会阻塞调研。关闭本地 embedding：`OLLAMA_ENABLED=0`。
+
+GPTR 失败时的行为：
+
+- 默认（`gptr_fallback_to_deepseek=false`）：空上下文或调用失败判为任务失败并明确报错，不会静默切换搜索源。
+- 设为 `true` 时，才自动用 DeepSeek Search 补搜一次。
 
 GPT Researcher 服务：
 
@@ -217,6 +247,8 @@ pip install -r gptr_service\requirements.txt
 # 也可以手动启动：
 python gptr_service\main.py
 ```
+
+凭据约定：服务按单 Key 运行，一次调研从规划到成稿使用同一个 Key，正常使用无需配置多 Key。只有在确有多个不同 Key 的调用方并发提交时，才需要分别启动独立实例。
 
 Playwright：
 
@@ -229,7 +261,7 @@ playwright install chromium
 
 ```mermaid
 flowchart TD
-    A[输入需求] --> B[准备：意图识别 + 输入清洗]
+    A[输入需求] --> B[准备：输入清洗]
     B --> C{超深度模式?}
     C -- 是 --> D[框架涌现 + 用户确认 + 深度管线]
     C -- 否 --> E[智能澄清]
@@ -249,7 +281,7 @@ flowchart TD
 
 | 阶段 | 做什么 | 失败后 |
 |---|---|---|
-| 准备任务 | 意图识别、输入清洗 | 可重试 |
+| 准备任务 | 输入清洗 | 可重试 |
 | 澄清追问 | 必问问题 + 可推理项 | 可重试 |
 | 生成调研计划 | 方向、追问、搜索批次 | 可重试 |
 | 确认调研计划 | 人工确认；修改意见会重新生成计划 | 可重试 |
@@ -282,34 +314,70 @@ flowchart TD
 
 ## 项目结构
 
+自研代码约 2.1 万行，另有带补丁的 GPT Researcher 约 1.1 万行。
+
 ```text
 AI-DesktopResearch/
-├─ 调研工具/                 # 桌面工具主目录
-│  ├─ main.py                # tkinter GUI
-│  ├─ engine.py              # 调研编排引擎
-│  ├─ search.py              # 搜索、抓取、GPTR 适配
-│  ├─ memory.py              # 当前任务内的 BM25 + Ollama 混合检索
-│  ├─ material_synthesizer.py# 素材聚类与综合
-│  ├─ deliverables.py        # Word/Excel/图表/Dashboard
-│  ├─ task_state.py          # 任务状态与断点
-│  └─ test_*.py              # 回归测试
-├─ shared/                   # 共享 LLM、搜索模型、推演、质量门禁
-├─ gptr_service/             # 可选 GPT Researcher FastAPI 服务
-├─ third_party/gpt_researcher# 带补丁的 GPTR 源码
-├─ docs/                     # Wiki 与设计文档
-└─ requirements-research.txt # 桌面调研最小依赖
+├─ 调研工具/                      # 24 个文件，约 15.5k 行
+│  ├─ main.py                     # tkinter GUI：三页签、日志代理、控制面交互
+│  ├─ engine.py                   # 编排引擎：阶段机、预算、断点、质量门禁
+│  ├─ search.py                   # 搜索层：多适配器、打分、GPTR 适配、STORM
+│  ├─ memory.py                   # Ollama 向量 + BM25 混合检索
+│  ├─ material_synthesizer.py     # 素材聚类与综合报告
+│  ├─ knowledge_extractor.py      # 实体、数据点、结论抽取
+│  ├─ deliverables.py             # Word/Excel/图表/Dashboard/精炼版编译
+│  ├─ deep_scraper.py             # DeepSeek Fetch / Crawl4AI 双通道深抓
+│  ├─ task_state.py               # 阶段状态、原子写、失败恢复
+│  ├─ framework_loader.py         # 自定义研究框架模板
+│  ├─ v15_3_config.py             # 信源 S/A/B/C 分级
+│  ├─ v16_1_utils.py              # 成本追踪、全文增强、截断
+│  ├─ config.py                   # LLM 客户端、提示词、密钥加密
+│  └─ test_*.py                   # 四套回归测试
+├─ shared/                        # 19 个文件，约 3.8k 行
+│  ├─ claim_ledger.py             # 声明账本 + QualityGate
+│  ├─ deduction_engine.py         # 推演引擎：判断必问 / 可推理
+│  ├─ input_guard.py              # 输入清洗与注入防护
+│  ├─ agent_security.py           # 工具调用策略与审计
+│  ├─ browser_manager.py          # 浏览器生命周期
+│  ├─ robots_checker.py           # robots.txt 合规
+│  ├─ md_to_docx.py               # pandoc / python-docx 双路径
+│  ├─ prompt_cache.py             # 提示词缓存
+│  ├─ prompt_security.py          # 系统提示安全后缀
+│  └─ search/                     # 适配器、信源分级、缓存、打分
+├─ gptr_service/                  # 9 个文件，约 1.4k 行：FastAPI + 队列 + worker + 健康检查
+├─ third_party/gpt_researcher/    # 110 个文件，约 11k 行（带补丁）
+├─ docs/                          # Wiki、全链路、修复记录
+└─ requirements-research.txt
 ```
+
+### 能力地图
+
+| 层 | 实际实现 |
+|---|---|
+| 交互层 | tkinter 三页签；澄清/计划/骨架三道人工确认；控制面支持改页数、加图表、删章节、调顺序、补素材；底部常驻确认/重做/补搜 |
+| 编排层 | 固定阶段机；搜索预算硬上限；阶段级断点与恢复；失败重试；任务状态原子落盘 |
+| 澄清层 | 推演引擎区分“必问”与“可推理”；5W2H 自检；用户答案注入后续计划与搜索 |
+| 规划层 | 方向、核心追问、搜索批次契约；批次收敛；查询预审；广度模式实体预处理 |
+| 检索层 | GPTR 主搜索 + 批次搜索 + STORM（可选）+ DeepSeek Search 回退；查询缓存；robots 合规；Playwright / DeepSeek Fetch / Crawl4AI 三种抓取 |
+| 素材层 | URL 去重、同品牌软文合并、信源分级、相关性准入、主题聚类、分层注入、声明账本 |
+| 证据层 | `[n]` 编号、来源附录、S/A/B/C 分级、声明状态、数据密度与来源多样性门禁 |
+| 写作层 | 逐章扩写 + 定向补搜 + 事实核查 + 双向审稿 + 编造检测 + 跨章上下文；超预算精简 |
+| 交付层 | Word（A4 / 2.5cm 边距 / 表格 9pt / 图片 5 英寸）、Excel、图表（数值表直读 → Plotly → Mermaid → Matplotlib）、Dashboard、精炼版（含表格） |
+| 安全层 | 随机密钥加密、域黑名单、输入防护、工具调用策略与审计、提示注入后缀防护 |
+| 恢复层 | 阶段状态、素材、大纲、章节逐段落盘；重试跳过已完成阶段 |
 
 ## 测试
 
 在 `调研工具` 目录下：
 
 ```powershell
+python test_guards.py
+python test_regression.py
+python test_engine.py --quick
 python -m unittest test_audit_fixes -v
-python test_suite.py --quick
 ```
 
-测试默认使用 mock 数据，不调用真实 API、不启动 Ollama、不访问网络。完整测试和真实端到端调研需要配置 Key 与本机服务。
+四套测试默认使用 mock 数据，不调用真实 API、不启动 Ollama、不访问网络。完整测试和真实端到端调研需要配置 Key 与本机服务。
 
 ## 能力边界
 
@@ -317,6 +385,8 @@ python test_suite.py --quick
 - 不接收本地文件上传；不支持私有知识库注入。
 - 不提供积分、订单、邮件、支付等业务系统。
 - 不保证所有数据都能被公开来源验证；报告会标注数据受限和未知缺口。
+- 本地 embedding 是可选增强；关闭或不可用时按词面相关性筛选，检索覆盖不变，语义排序质量下降。
+- 某章两次补搜仍无素材时，默认用 AI 训练知识补写该章，并在标题标注【AI训练知识】；可在配置中关闭（`enable_ai_knowledge_fallback`）。关闭后日志会提示，可在【控制面修改】输入关键词（逗号分隔）后点【补搜本章】重试。
 - 质量评分是工程自检，不是事实仲裁。
 - 超深度模式的质量检查覆盖少于常规模式。
 

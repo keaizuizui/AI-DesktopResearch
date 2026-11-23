@@ -10,7 +10,7 @@ from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader
 )
 # [PATCHED] 使用 pdfplumber (MIT) 替代 PyMuPDFLoader (AGPL)
-from gpt_researcher.patches.pdfplumber_loader import PDFPlumberLoader as PyMuPDFLoader
+from gpt_researcher.patches.pdfplumber_loader import PDFPlumberLoader
 
 
 class OnlineDocumentLoader:
@@ -64,7 +64,7 @@ class OnlineDocumentLoader:
         ret_data = []
         try:
             loader_dict = {
-                "pdf": PyMuPDFLoader(file_path),
+                "pdf": PDFPlumberLoader(file_path),
                 "txt": TextLoader(file_path),
                 "doc": UnstructuredWordDocumentLoader(file_path),
                 "docx": UnstructuredWordDocumentLoader(file_path),

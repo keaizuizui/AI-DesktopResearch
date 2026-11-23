@@ -38,8 +38,8 @@ print('\n[测试2] _build_enriched_query() 精简查询构建')
 from search import _build_enriched_query
 
 q = _build_enriched_query("调研2025年中国新能源汽车市场", plan)
-check("查询长度<=400", len(q) <= 400, f"实际{len(q)}字")
-check("含方向摘要", "重点方向" in q)
+check("查询长度<=150", len(q) <= 150, f"实际{len(q)}字")
+check("含任务主体与方向内容", "新能源汽车" in q and ("市场规模" in q or "竞争格局" in q), f"实际: {q[:60]}")
 
 # ========== 测试3: _build_parallel_queries ==========
 print('\n[测试3] _build_parallel_queries() 并行查询拆分')

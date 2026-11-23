@@ -47,3 +47,7 @@ Thumbs.db
 .coderef/
 .gitnexus/
 docs/cr*.txt
+
+# 本机 AI 协作规则与内部工作文档
+AGENTS.md
+docs/修复方案_*.md

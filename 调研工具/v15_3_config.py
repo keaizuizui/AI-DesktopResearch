@@ -81,16 +81,6 @@ def get_source_tier(score: float) -> str:
     else:
         return "C"
 
-def get_source_tier_color(tier: str) -> str:
-    """返回等级对应的颜色（用于前端展示）"""
-    colors = {
-        "S": "#d4af37",  # 金色
-        "A": "#27ae60",  # 绿色
-        "B": "#3498db",  # 蓝色
-        "C": "#95a5a6",  # 灰色
-    }
-    return colors.get(tier, "#95a5a6")
-
 # 等级描述
 
 CHAPTER_BUDGET = {

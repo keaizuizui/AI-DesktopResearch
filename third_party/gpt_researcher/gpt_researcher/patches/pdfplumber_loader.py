@@ -73,7 +73,7 @@ def load_pdf_with_pdfplumber(url_or_path: str) -> str:
     """
     使用 pdfplumber 加载PDF并返回文本
     
-    替代 scrape_skills.py 中的 scrape_pdf_with_pymupdf()
+    替代 scrape_skills.py 中的 scrape_pdf_with_pdfplumber()
     
     Args:
         url_or_path: PDF的URL或本地路径

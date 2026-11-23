@@ -53,8 +53,11 @@ class GPTRWorker:
         _json.dumps = _patched_json_dumps
     
     def _suppress_warnings(self):
-        """抑制 GPT-Researcher 的警告日志"""
-        logging.getLogger("gpt_researcher").setLevel(logging.ERROR)
+        """抑制 GPT-Researcher 的噪音日志；GPTR_LOG_LEVEL=INFO 可打开诊断日志。"""
+        import os
+        level_name = os.getenv("GPTR_LOG_LEVEL", "ERROR").upper()
+        level = getattr(logging, level_name, logging.ERROR)
+        logging.getLogger("gpt_researcher").setLevel(level)
         logging.getLogger("bs4").setLevel(logging.ERROR)
         try:
             from bs4 import XMLParsedAsHTMLWarning
@@ -73,8 +76,8 @@ class GPTRWorker:
     def _apply_config(self, task_config: dict):
         """应用任务级配置。
 
-        注意：不把任务级 Key 写入进程环境，避免 /config/reload 把
-        某个任务的凭据提升为全局配置；凭据仅在 execute() 中注入实例。
+        GPTR 的 LLM/检索客户端直接读环境变量，任务级凭据必须注入环境才生效；
+        /config/reload 之后仍以任务传入的凭据为准。
         """
         # 先应用全局配置
         config.apply_to_env()
@@ -83,6 +86,24 @@ class GPTRWorker:
         if task_config.get("search_provider"):
             import os
             os.environ["RETRIEVER"] = task_config["search_provider"]
+
+        # 任务级凭据优先级最高，覆盖环境中的旧 Key
+        api_key = task_config.get("llm_api_key")
+        base_url = task_config.get("llm_base_url")
+        if api_key:
+            import os
+            prev = os.environ.get("OPENAI_API_KEY", "")
+            if prev and api_key != prev:
+                self.logger.warning(
+                    "[Credential] 检测到任务 Key 与进程当前 Key 不同；本服务按单 Key 设计，"
+                    "正常使用不会出现此提示，仅在多个不同 Key 并发提交时需拆分实例"
+                )
+            os.environ["OPENAI_API_KEY"] = api_key
+            os.environ["DEEPSEEK_API_KEY"] = api_key
+        if base_url:
+            import os
+            os.environ["OPENAI_BASE_URL"] = base_url
+            os.environ["OPENAI_API_BASE"] = base_url
     
     async def execute(self, task: ResearchTask) -> str:
         """
@@ -137,10 +158,16 @@ class GPTRWorker:
         timeout = float(task.timeout or config.service.task_timeout or 600)
         try:
             report = await asyncio.wait_for(researcher.conduct_research(), timeout=timeout)
+            text = report if isinstance(report, str) else (
+                json.dumps(report, ensure_ascii=False) if report else ""
+            )
+            min_chars = int(getattr(config.service, "min_report_chars", 200) or 200)
+            if len(text.strip()) < min_chars:
+                raise RuntimeError(f"GPTR 返回空上下文（{len(text.strip())} 字符），按失败处理")
             task.progress = 100
             task.stage = "completed"
-            self.logger.info(f"[Task {task.task_id}] 完成")
-            return report
+            self.logger.info(f"[Task {task.task_id}] 完成（{len(text)} 字符）")
+            return text
         except asyncio.TimeoutError:
             self.logger.error(f"[Task {task.task_id}] 超时（{timeout:.0f}s）")
             raise
