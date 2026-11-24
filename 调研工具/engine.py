@@ -3999,6 +3999,9 @@ class FusionResearchBot:
         """把素材覆盖不足的多条信号合并成报告开头的一段说明。"""
         if not self.chapters_md or not notes:
             return
+        # 质量阶段重试/恢复时避免重复插入
+        if "> ⚠️ **素材覆盖说明**" in self.chapters_md[0]:
+            return
         lines = ["\n\n> ⚠️ **素材覆盖说明**"]
         for note in notes:
             lines.append(f"> - {note}")
@@ -4008,6 +4011,11 @@ class FusionResearchBot:
 
     def _insert_quality_gate_notice(self, gate):
         """质量门禁未通过时，在报告开头插入可追溯说明（不阻断交付）。"""
+        if not self.chapters_md:
+            return
+        # 质量阶段重试/恢复时避免重复插入
+        if "> ⚠️ **质量门禁未通过**" in self.chapters_md[0]:
+            return
         lines = [f"\n\n> ⚠️ **质量门禁未通过**：{gate.summary}"]
         for c in gate.unsupported_claims[:5]:
             lines.append(f"> - 无来源/推断：{c.field_name} = {str(c.value)[:60]}")
