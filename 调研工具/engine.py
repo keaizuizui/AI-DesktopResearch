@@ -3661,6 +3661,25 @@ class FusionResearchBot:
         result["citation_count"] = len(citations)
         result["invalid_citations"] = sorted(invalid_citations)
         result["citation_ok"] = not invalid_citations
+
+        # 越界引用通常是模型编造的编号：确定性标记为 [?]，避免读者误以为有来源
+        fixed_citations = 0
+        if invalid_citations and self.chapters_md:
+            bad = set(invalid_citations)
+
+            def _mark_invalid(m):
+                return "[?]" if int(m.group(1)) in bad else m.group(0)
+
+            for i, ch in enumerate(self.chapters_md):
+                new_ch = re.sub(r'\[(\d+)\]', _mark_invalid, ch)
+                if new_ch != ch:
+                    fixed_citations += (len(re.findall(r'\[\?\]', new_ch))
+                                        - len(re.findall(r'\[\?\]', ch)))
+                    self.chapters_md[i] = new_ch
+        result["fixed_citations"] = fixed_citations
+        if fixed_citations:
+            logger.warning(f"[自检] 已将 {fixed_citations} 处越界引用标记为 [?]")
+
         result["all_ok"] = (result["num_density_ok"] and result["cite_density_ok"]
                             and result["overlap_ok"] and result["citation_ok"])
 
@@ -3700,6 +3719,7 @@ class FusionResearchBot:
                 if ch_density < 3:
                     self.chapters_md[i] += f"\n\n> ⚠️ [本地测试] 本章数据密度 {ch_density:.1f}/千字（标准≥3），建议补搜后重新生成。"
 
+        self._last_self_check = result
         return result
 
     def _data_trap_check(self) -> Dict:
@@ -3848,6 +3868,65 @@ class FusionResearchBot:
 
         return result
 
+    def _fix_cross_chapter_conflicts(self, issues: List[Dict]) -> int:
+        """对跨章数据矛盾做一次尽力修正：LLM 给出句子级替换，确定性应用到章节。
+
+        只处理带章节号的矛盾，最多 3 章；替换失败就跳过，不阻断交付。
+        返回实际修正的句子数。
+        """
+        llm = getattr(self, "llm", None)
+        if not issues or not llm or not getattr(llm, "available", False):
+            return 0
+
+        by_chapter: Dict[int, List[Dict]] = {}
+        for issue in issues:
+            ch_no = issue.get("chapter")
+            if not ch_no:
+                m = re.search(r'第\s*(\d+)\s*章', str(issue.get("location", "")))
+                ch_no = int(m.group(1)) if m else None
+            if ch_no and 1 <= ch_no <= len(self.chapters_md):
+                by_chapter.setdefault(ch_no, []).append(issue)
+        if not by_chapter:
+            return 0
+
+        fixed_total = 0
+        for ch_no, ch_issues in list(by_chapter.items())[:3]:
+            content = self.chapters_md[ch_no - 1]
+            if len(content) < 80:
+                continue
+            issue_text = "\n".join(f"- {i.get('detail', '')}" for i in ch_issues)
+            prompt = f"""你是报告统稿编辑。下面这一章存在跨章数据矛盾，请只修正矛盾数值，不改写其他内容。
+【矛盾清单】
+{issue_text}
+【章节内容】
+{content[:6000]}
+【输出要求】
+只输出 JSON：{{"fixes":[{{"old":"原文中逐字出现的完整句子","new":"修正后的句子"}}]}}
+规则：
+1. old 必须与章节原文完全一致，包含标点；
+2. new 只调整矛盾数值或补充口径说明，不改变原意；
+3. 无法判断哪个数值正确时，改为范围表述或删除绝对数值；
+4. 没有可修正的句子就返回 {{"fixes":[]}}。"""
+            try:
+                raw = self._agent_call(
+                    "editor", [{"role": "user", "content": prompt}],
+                    max_tokens=1200, json_mode=True)
+                data = safe_json_loads(raw, {})
+                for fix in (data.get("fixes") or [])[:5]:
+                    old = str(fix.get("old", "")).strip()
+                    new = str(fix.get("new", "")).strip()
+                    if old and new and old != new and old in content:
+                        content = content.replace(old, new, 1)
+                        fixed_total += 1
+                self.chapters_md[ch_no - 1] = content
+                logger.info(f"[跨章修正] 第{ch_no}章处理完成")
+            except Exception as e:
+                logger.warning(f"[跨章修正] 第{ch_no}章失败: {e}")
+
+        if fixed_total:
+            logger.info(f"[跨章修正] 共修正 {fixed_total} 处矛盾表述")
+        return fixed_total
+
     def _check_source_diversity(self) -> Dict:
         """来源多样性硬线检查。
 
@@ -3938,6 +4017,12 @@ class FusionResearchBot:
                 f"（{c.source_id or '引用'}，素材原文未找到该数值）")
         for c in gate.disputed_claims[:3]:
             lines.append(f"> - 被质疑：{c.field_name} = {str(c.value)[:60]}")
+        self_check = getattr(self, "_last_self_check", {}) or {}
+        if self_check.get("fixed_citations"):
+            lines.append(f"> - 越界引用：{self_check['fixed_citations']} 处已标记为 [?]")
+        trap = getattr(self, "_last_data_trap", {}) or {}
+        if trap.get("fixed_conflicts"):
+            lines.append(f"> - 跨章矛盾：已尝试修正 {trap['fixed_conflicts']} 处表述")
         quality_report = getattr(self, "_last_quality_report", {}) or {}
         if quality_report.get("citation_support_ok") is False:
             lines.append(
@@ -5058,6 +5143,10 @@ class FusionResearchBot:
 
         # 数据防坑检查（单位搞混/趋势造假/张冠李戴/跨章一致性）
         self._last_data_trap = self._data_trap_check()
+        fixed_conflicts = self._fix_cross_chapter_conflicts(
+            (self._last_data_trap or {}).get("cross_chapter_inconsistencies", []))
+        if fixed_conflicts:
+            self._last_data_trap["fixed_conflicts"] = fixed_conflicts
 
         # 来源多样性 + 批次预算 + AI 补章：合并成一条素材覆盖说明
         source_diversity = self._check_source_diversity()
