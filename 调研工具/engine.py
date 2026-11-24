@@ -5190,6 +5190,10 @@ class FusionResearchBot:
             except Exception as e:
                 logger.warning(f"[质量门禁] 执行失败: {e}")
 
+        # 质量阶段会修改章节（引用标记、跨章修正、提示），重新落盘最终版本
+        if self._state_store:
+            self._persist_chapters()
+
     def _step_output_to_gui(self):
         """步骤16: 输出到 GUI"""
         # 记录任务完成事件 + 保存声明账本
